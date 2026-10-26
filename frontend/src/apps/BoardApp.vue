@@ -9,6 +9,7 @@ import BugDrawer from '../components/BugDrawer.vue'
 import SettingsDialog from '../components/SettingsDialog.vue'
 import EmptyArt from '../components/EmptyArt.vue'
 import { CATEGORIES, SEVERITIES, STATUS_COLUMNS } from '../lib/constants'
+import { defaultHotkey } from '../lib/platform'
 
 const { bugs, error, load, updateStatus } = useBugs()
 
@@ -17,7 +18,7 @@ const filterCategory = ref('')
 const filterSeverity = ref('')
 const drawerId = ref('')
 const settingsOpen = ref(false)
-const hotkey = ref('Ctrl+Alt+R')
+const hotkey = ref(defaultHotkey)
 const loaded = ref(false)
 const searchRef = ref<HTMLInputElement>()
 let offSettings: (() => void) | undefined

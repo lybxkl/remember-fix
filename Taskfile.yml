@@ -10,15 +10,16 @@ vars:
 includes:
   common: ./build/Taskfile.yml
   windows: ./build/windows/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
 
 tasks:
   build:
-    summary: Builds the application
+    summary: Builds the application for the current OS
     cmds:
       - task: "{{.GOOS}}:build"
 
   package:
-    summary: Packages a production build (NSIS)
+    summary: Packages a production build (NSIS installer on Windows, .app on macOS)
     cmds:
       - task: "{{.GOOS}}:package"
 

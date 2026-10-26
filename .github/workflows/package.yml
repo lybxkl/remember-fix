@@ -1,0 +1,220 @@
+name: Package Desktop App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "要发布的已存在 Git tag，例如 v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  WAILS_VERSION: v3.0.0-beta.34
+
+jobs:
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            os: windows-latest
+            package_command: wails3 package GOOS=windows ARCH=amd64
+          - name: macos-universal
+            os: macos-latest
+            package_command: wails3 task darwin:package:universal
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag_name) || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Add Go bin to PATH
+        shell: bash
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Windows installer dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $makensis) {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            )
+            $makensisPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $makensisPath) {
+              throw "makensis.exe was not found after installing NSIS."
+            }
+            $nsisDir = Split-Path -Parent $makensisPath
+            $env:Path = "$nsisDir;$env:Path"
+            Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+            $makensis = Get-Command makensis -ErrorAction Stop
+          }
+          # 无论 choco shim 是否已在 PATH，都把实际目录带给后续构建步骤。
+          $nsisDir = Split-Path -Parent $makensis.Source
+          Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+          Write-Host "Using NSIS: $($makensis.Source)"
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@${{ env.WAILS_VERSION }}
+
+      - name: Sync build metadata from config
+        run: wails3 update build-assets -name "remember-fix" -binaryname "remember-fix" -config build/config.yml -dir build
+
+      - name: Build package
+        shell: bash
+        run: ${{ matrix.package_command }}
+
+      - name: Collect release files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $portable = 'bin\remember-fix.exe'
+          $installer = 'bin\remember-fix-amd64-installer.exe'
+          if (-not (Test-Path -LiteralPath $portable)) {
+            throw "No Windows executable was generated at $portable."
+          }
+          if (-not (Test-Path -LiteralPath $installer)) {
+            throw "No NSIS installer was generated at $installer."
+          }
+          Copy-Item -LiteralPath $portable -Destination 'dist\remember-fix-windows-amd64.exe' -Force
+          Copy-Item -LiteralPath $installer -Destination 'dist\remember-fix-windows-amd64-installer.exe' -Force
+          Write-Host "Release files:"
+          Get-ChildItem -Path dist -File | Sort-Object Name | ForEach-Object { Write-Host " - $($_.Name)" }
+
+      - name: Collect release files (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          app_path="$(find bin -maxdepth 1 -name '*.app' -type d -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo "No .app bundle found in bin" >&2
+            exit 1
+          fi
+          archs="$(lipo -archs "$app_path/Contents/MacOS/remember-fix")"
+          echo "Universal architectures: $archs"
+          case " $archs " in *" x86_64 "*) ;; *) echo "missing x86_64 slice" >&2; exit 1 ;; esac
+          case " $archs " in *" arm64 "*) ;; *) echo "missing arm64 slice" >&2; exit 1 ;; esac
+
+          rm -rf dmg-root
+          mkdir -p dmg-root
+          cp -R "$app_path" dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create \
+            -volname "Remember-Fix" \
+            -srcfolder dmg-root \
+            -ov \
+            -format UDZO \
+            "dist/remember-fix-macos-universal.dmg"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app_path" \
+            "dist/remember-fix-macos-universal.zip"
+          ls -lh dist
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: remember-fix-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag_name) || github.ref }}
+
+      - name: Verify tag matches config version
+        shell: bash
+        run: |
+          # 版本号以 build/config.yml 的 info.version 为唯一事实来源。
+          tag="${RELEASE_TAG#v}"
+          cfg=$(awk '
+            /^info:/ { in_info = 1; next }
+            /^[^ \t]/ { in_info = 0 }
+            in_info && /^[ \t]+version:/ { sub(/^[ \t]+version:[ \t]*/, ""); print; exit }
+          ' build/config.yml | tr -d "\"'")
+          if [ -z "$cfg" ]; then
+            echo "build/config.yml info.version 为空" >&2
+            exit 1
+          fi
+          if [ "$tag" != "$cfg" ]; then
+            echo "Git tag ($tag) 与 build/config.yml info.version ($cfg) 不一致" >&2
+            echo "请先修改 build/config.yml 的 info.version 再打对应 tag" >&2
+            exit 1
+          fi
+          echo "版本号一致: $cfg"
+
+      - name: Download release files
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          pattern: remember-fix-*
+          merge-multiple: true
+
+      - name: Publish release
+        shell: bash
+        run: |
+          for f in \
+            release-assets/remember-fix-windows-amd64.exe \
+            release-assets/remember-fix-windows-amd64-installer.exe \
+            release-assets/remember-fix-macos-universal.dmg \
+            release-assets/remember-fix-macos-universal.zip; do
+            if [ ! -f "$f" ]; then
+              echo "缺少发布产物: $f" >&2
+              exit 1
+            fi
+          done
+          find release-assets -maxdepth 1 -type f -printf ' - %f\n' | sort
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "记得修 $RELEASE_TAG" \
+              --generate-notes \
+              --latest
+          fi
+          # 只覆盖本工作流产出的同名资产，保留 Release 上其他手动附件。
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --latest --draft=false

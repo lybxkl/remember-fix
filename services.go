@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,14 +33,15 @@ type AppShell struct {
 	edgeWin    *application.WebviewWindow
 	trigger    func()
 
-	edgeDock       string
-	edgeOffset     int
-	edgeOffsetSet  bool
-	edgeDragging   bool
-	edgeDragStartX int
-	edgeDragStartY int
-	edgeWinStartX  int
-	edgeWinStartY  int
+	edgeDock      string
+	edgeOffset    int
+	edgeOffsetSet bool
+	edgeStore     *store.Store
+	edgeLayoutMu  sync.Mutex
+
+	edgeDragMu       sync.Mutex
+	edgeDragging     bool
+	edgeDragEndTimer *time.Timer
 
 	hotkeyMu sync.Mutex
 	hotkey   string
@@ -48,10 +50,10 @@ type AppShell struct {
 }
 
 const (
-	edgeCollapsedWidth  = 18
+	edgeCollapsedWidth  = 24
 	edgeCollapsedHeight = 64
 	edgeDockBarWidth    = 64
-	edgeDockBarHeight   = 18
+	edgeDockBarHeight   = 24
 	edgeExpandedWidth   = 184
 	edgeExpandedHeight  = 232
 )
@@ -90,6 +92,12 @@ func edgeWindowSize(dock string, expanded bool) (int, int) {
 }
 
 func (s *AppShell) layoutEdge(expanded bool) {
+	s.edgeLayoutMu.Lock()
+	defer s.edgeLayoutMu.Unlock()
+	s.layoutEdgeLocked(expanded)
+}
+
+func (s *AppShell) layoutEdgeLocked(expanded bool) {
 	if s.edgeWin == nil || s.app == nil {
 		return
 	}
@@ -141,10 +149,116 @@ func (s *AppShell) layoutEdge(expanded bool) {
 	s.edgeWin.SetPosition(x, y)
 }
 
+func (s *AppShell) resetEdgeDrag() {
+	s.edgeDragMu.Lock()
+	s.edgeDragging = false
+	if s.edgeDragEndTimer != nil {
+		s.edgeDragEndTimer.Stop()
+		s.edgeDragEndTimer = nil
+	}
+	s.edgeDragMu.Unlock()
+}
+
+func (s *AppShell) beginEdgeDrag() {
+	s.edgeDragMu.Lock()
+	s.edgeDragging = true
+	if s.edgeDragEndTimer != nil {
+		s.edgeDragEndTimer.Stop()
+		s.edgeDragEndTimer = nil
+	}
+	s.edgeDragMu.Unlock()
+}
+
+// macOS 没有单独的窗口拖动结束事件，用最后一次移动后的静默期兜底；
+// 正常情况下前端会在 mouseup 时直接调用 EndDrag。
+func (s *AppShell) noteEdgeMoved() {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	s.edgeDragMu.Lock()
+	if !s.edgeDragging {
+		s.edgeDragMu.Unlock()
+		return
+	}
+	if s.edgeDragEndTimer != nil {
+		s.edgeDragEndTimer.Stop()
+	}
+	s.edgeDragEndTimer = time.AfterFunc(900*time.Millisecond, s.finishEdgeDrag)
+	s.edgeDragMu.Unlock()
+}
+
+// edgeDockTarget 用窗口中心到工作区四边的距离选最近边，并给出沿边中心（收起状态）。
+func edgeDockTarget(wa application.Rect, x, y, width, height int) (dock string, offset int) {
+	if width <= 0 || height <= 0 {
+		width, height = edgeExpandedWidth, edgeExpandedHeight
+	}
+	cx := x + width/2
+	cy := y + height/2
+	dock = "right"
+	nearest := wa.X + wa.Width - cx
+	if left := cx - wa.X; left < nearest {
+		dock, nearest = "left", left
+	}
+	if top := cy - wa.Y; top < nearest {
+		dock, nearest = "top", top
+	}
+	if bottom := wa.Y + wa.Height - cy; bottom < nearest {
+		dock = "bottom"
+	}
+	if dock == "left" || dock == "right" {
+		offset = clampInt(cy, wa.Y+edgeCollapsedHeight/2, wa.Y+wa.Height-edgeCollapsedHeight/2)
+	} else {
+		offset = clampInt(cx, wa.X+edgeDockBarWidth/2, wa.X+wa.Width-edgeDockBarWidth/2)
+	}
+	return dock, offset
+}
+
+// finishEdgeDrag 以窗口实际位置计算最近边，写入设置并吸附；可被窗口事件和前端重复调用。
+func (s *AppShell) finishEdgeDrag() {
+	s.edgeDragMu.Lock()
+	if !s.edgeDragging {
+		s.edgeDragMu.Unlock()
+		return
+	}
+	s.edgeDragging = false
+	if s.edgeDragEndTimer != nil {
+		s.edgeDragEndTimer.Stop()
+		s.edgeDragEndTimer = nil
+	}
+	s.edgeDragMu.Unlock()
+	defer emit("edge:drag-end", nil)
+
+	if s.edgeWin == nil || s.app == nil {
+		return
+	}
+	screen := s.app.Screen.GetPrimary()
+	if screen == nil || screen.WorkArea.Width <= 0 || screen.WorkArea.Height <= 0 {
+		return
+	}
+	x, y := s.edgeWin.Position()
+	width, height := s.edgeWin.Size()
+	if width <= 0 || height <= 0 {
+		width, height = edgeExpandedWidth, edgeExpandedHeight
+	}
+	dock, offset := edgeDockTarget(screen.WorkArea, x, y, width, height)
+	s.edgeLayoutMu.Lock()
+	s.edgeDock = dock
+	s.edgeOffset = offset
+	s.edgeOffsetSet = true
+	s.layoutEdgeLocked(true)
+	s.edgeLayoutMu.Unlock()
+	if s.edgeStore != nil {
+		_ = s.edgeStore.SetSetting("edge.dock", dock)
+		_ = s.edgeStore.SetSetting("edge.offset", strconv.Itoa(offset))
+	}
+	emit("edge:dock", dock)
+}
+
 func (s *AppShell) SetEdgeEnabled(enabled bool) {
 	if s.edgeWin == nil {
 		return
 	}
+	s.resetEdgeDrag()
 	if !enabled {
 		emit("edge:collapse", nil)
 		s.edgeWin.Hide()
@@ -159,6 +273,7 @@ func (s *AppShell) ShowMain() {
 	if s.mainWin == nil {
 		return
 	}
+	s.mainWin.UnMinimise()
 	s.mainWin.Show()
 	s.mainWin.Focus()
 }
@@ -230,6 +345,7 @@ type CaptureService struct {
 
 // Trigger 抓取剪贴板快照，推送给捕获窗并显示窗口。
 func (s *CaptureService) Trigger() {
+	s.shell.resetEdgeDrag()
 	s.shell.layoutEdge(false)
 	emit("edge:collapse", nil)
 	snap := s.capturer.SnapshotNow()
@@ -277,82 +393,21 @@ func (s *EdgeService) SetExpanded(expanded bool) error {
 	return nil
 }
 
-// BeginDrag 记录拖动起点；随后 DragTo 按屏幕坐标移动窗口。
-func (s *EdgeService) BeginDrag(screenX, screenY int) error {
+// BeginDrag 标记原生拖窗开始；实际移动由系统接管，这里不再逐帧改窗口位置。
+func (s *EdgeService) BeginDrag() error {
 	if err := s.ready(); err != nil {
 		return err
 	}
-	// 拖动统一在展开卡片上进行，避免收起态拖拽后窗口尺寸与前端状态不一致。
-	s.shell.layoutEdge(true)
-	x, y := s.shell.edgeWin.Position()
-	s.shell.edgeDragStartX = screenX
-	s.shell.edgeDragStartY = screenY
-	s.shell.edgeWinStartX = x
-	s.shell.edgeWinStartY = y
-	s.shell.edgeDragging = true
+	s.shell.beginEdgeDrag()
 	return nil
 }
 
-func (s *EdgeService) DragTo(screenX, screenY int) error {
-	if s.shell == nil || s.shell.edgeWin == nil || !s.shell.edgeDragging || s.shell.app == nil {
-		return nil
+// EndDrag 在松手（macOS 的 pointerup 或兜底路径）后吸附到最近屏幕边缘。
+func (s *EdgeService) EndDrag() error {
+	if err := s.ready(); err != nil {
+		return err
 	}
-	screen := s.shell.app.Screen.GetPrimary()
-	if screen == nil {
-		return nil
-	}
-	wa := screen.WorkArea
-	width, height := s.shell.edgeWin.Size()
-	if width <= 0 || height <= 0 {
-		width, height = edgeExpandedWidth, edgeExpandedHeight
-	}
-	x := s.shell.edgeWinStartX + screenX - s.shell.edgeDragStartX
-	y := s.shell.edgeWinStartY + screenY - s.shell.edgeDragStartY
-	x = clampInt(x, wa.X, wa.X+wa.Width-width)
-	y = clampInt(y, wa.Y, wa.Y+wa.Height-height)
-	s.shell.edgeWin.SetPosition(x, y)
-	return nil
-}
-
-// EndDrag 松手后吸附到最近屏幕边缘，并记住沿边位置。
-func (s *EdgeService) EndDrag(screenX, screenY int) error {
-	if s.shell == nil || s.shell.edgeWin == nil || !s.shell.edgeDragging || s.shell.app == nil {
-		return nil
-	}
-	s.shell.edgeDragging = false
-	screen := s.shell.app.Screen.GetPrimary()
-	if screen == nil || screen.WorkArea.Width <= 0 || screen.WorkArea.Height <= 0 {
-		return nil
-	}
-	wa := screen.WorkArea
-	cx := clampInt(screenX, wa.X, wa.X+wa.Width)
-	cy := clampInt(screenY, wa.Y, wa.Y+wa.Height)
-	dock := "right"
-	nearest := wa.X + wa.Width - cx
-	if left := cx - wa.X; left < nearest {
-		dock, nearest = "left", left
-	}
-	if top := cy - wa.Y; top < nearest {
-		dock, nearest = "top", top
-	}
-	if bottom := wa.Y + wa.Height - cy; bottom < nearest {
-		dock = "bottom"
-	}
-	var offset int
-	if dock == "left" || dock == "right" {
-		offset = clampInt(cy, wa.Y+edgeCollapsedHeight/2, wa.Y+wa.Height-edgeCollapsedHeight/2)
-	} else {
-		offset = clampInt(cx, wa.X+edgeDockBarWidth/2, wa.X+wa.Width-edgeDockBarWidth/2)
-	}
-	s.shell.edgeDock = dock
-	s.shell.edgeOffset = offset
-	s.shell.edgeOffsetSet = true
-	if s.store != nil {
-		_ = s.store.SetSetting("edge.dock", dock)
-		_ = s.store.SetSetting("edge.offset", strconv.Itoa(offset))
-	}
-	s.shell.layoutEdge(true)
-	emit("edge:dock", dock)
+	s.shell.finishEdgeDrag()
 	return nil
 }
 
@@ -361,6 +416,7 @@ func (s *EdgeService) Trigger() error {
 	if s.shell == nil || s.shell.trigger == nil {
 		return errors.New("捕获服务尚未就绪")
 	}
+	s.shell.resetEdgeDrag()
 	s.shell.layoutEdge(false)
 	go s.shell.trigger()
 	return nil

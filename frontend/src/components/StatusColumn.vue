@@ -99,7 +99,9 @@ function onDrop(e: DragEvent) {
   opacity: .7;
 }
 .column.over {
+  border-color: var(--col);
   border-color: color-mix(in srgb, var(--col) 55%, transparent);
+  background: var(--rf-bg-soft);
   background: color-mix(in srgb, var(--col) 5%, var(--rf-bg-soft));
 }
 .col-head {

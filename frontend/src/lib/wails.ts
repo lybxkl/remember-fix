@@ -1,8 +1,13 @@
-import { Call, Events } from '@wailsio/runtime'
+import { Call, Events, System } from '@wailsio/runtime'
 
 // 调用 Go 绑定服务：main 包服务的完全限定名
 export function call<T>(name: string, ...args: unknown[]): Promise<T> {
   return Call.ByName(name, ...args) as Promise<T>
+}
+
+// 交给系统原生拖窗：OS 接管鼠标后窗口平滑跟手，不会逐帧走同步 IPC。
+export function startNativeDrag() {
+  System.invoke('wails:drag')
 }
 
 // 订阅 Go 事件。Wails 的 emit data 可能是数组包裹，统一取第一个。

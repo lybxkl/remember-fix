@@ -6,6 +6,7 @@ import RichEditor from '../components/RichEditor.vue'
 import { useCapture } from '../composables/useCapture'
 import { call } from '../lib/wails'
 import { formatTime } from '../lib/constants'
+import { altName, defaultHotkey, modSymbol, screenshotKeys } from '../lib/platform'
 
 const { items, selected, selectedId, readyTick, select, sync, save, cancel } = useCapture()
 
@@ -13,7 +14,7 @@ const title = ref('')
 const description = ref('')
 const descriptionText = ref('')
 const saving = ref(false)
-const hotkey = ref('Ctrl+Alt+R')
+const hotkey = ref(defaultHotkey)
 const titleInput = ref<HTMLInputElement>()
 const editorRef = ref<InstanceType<typeof RichEditor>>()
 
@@ -178,7 +179,7 @@ function htmlToText(html: string): string {
           <div>
             <div class="empty-title">没有抓到剪贴板内容</div>
             <div class="empty-sub">
-              先 <kbd>Win</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> 截屏，或复制一段文字；也可以直接在下面记录
+              先 <template v-for="(key, i) in screenshotKeys" :key="key"><span v-if="i > 0">+</span><kbd>{{ key }}</kbd></template> 截屏到剪贴板，或复制一段文字；也可以直接在下面记录
             </div>
           </div>
         </div>
@@ -196,7 +197,7 @@ function htmlToText(html: string): string {
             <span v-else class="hist-text">TXT</span>
             <span class="hist-index">{{ i + 1 }}</span>
           </button>
-          <span class="hist-hint">Alt ←/→ 切换</span>
+          <span class="hist-hint">{{ altName }} ←/→ 切换</span>
         </div>
       </section>
 
@@ -227,7 +228,7 @@ function htmlToText(html: string): string {
     </div>
 
     <footer class="cap-foot">
-      <span class="cap-shortcuts"><kbd>Esc</kbd> 关闭 <span class="dot-sep">·</span> <kbd>Ctrl</kbd><kbd>↵</kbd> 保存</span>
+      <span class="cap-shortcuts"><kbd>Esc</kbd> 关闭 <span class="dot-sep">·</span> <kbd>{{ modSymbol }}</kbd><kbd>↵</kbd> 保存</span>
       <span class="spacer" />
       <button class="btn-ghost" @click="cancel">放弃</button>
       <button class="btn-commit" :disabled="saving || !hasSomething" @click="onSave">
@@ -377,6 +378,7 @@ function htmlToText(html: string): string {
   border-radius: 6px;
   padding: 3px 8px;
   cursor: pointer;
+  -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
 }
 .preview-insert:hover { border-color: var(--rf-accent); color: var(--rf-accent); }

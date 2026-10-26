@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { call, onEvent } from '../lib/wails'
+import { call, onEvent, startNativeDrag } from '../lib/wails'
+import { defaultHotkey } from '../lib/platform'
 
 type Dock = 'right' | 'left' | 'top' | 'bottom'
 
@@ -9,18 +10,19 @@ const expanded = ref(false)
 const busy = ref(false)
 const dragging = ref(false)
 const dock = ref<Dock>('right')
-const hotkey = ref('Ctrl+Alt+R')
+const hotkey = ref(defaultHotkey)
+const shellEl = ref<HTMLElement | null>(null)
 let leaveTimer: number | undefined
+let dragEndTimer: number | undefined
 let offCollapse: (() => void) | undefined
 let offDock: (() => void) | undefined
+let offDragEnd: (() => void) | undefined
 let pointerId: number | null = null
+let captureEl: HTMLElement | null = null
 let startX = 0
 let startY = 0
-let lastX = 0
-let lastY = 0
-let dragMoved = false
-let dragReady = false
-let endAfterBegin: { x: number; y: number } | null = null
+let dragArmed = false
+let expandTask: Promise<boolean> | null = null
 
 function isDock(value: unknown): value is Dock {
   return typeof value === 'string' && (DOCKS as string[]).includes(value)
@@ -42,12 +44,25 @@ onMounted(() => {
   offDock = onEvent<unknown>('edge:dock', (value) => {
     if (isDock(value)) dock.value = value
   })
+  // Windows 原生拖动期间 WebView 收不到 pointerup，由后端吸附完成后通知复位。
+  offDragEnd = onEvent('edge:drag-end', () => {
+    endDragState()
+    if (dragEndTimer) window.clearTimeout(dragEndTimer)
+    // 吸附后鼠标仍停在卡片上就保持展开；离开时交回正常的 hover 收起逻辑。
+    dragEndTimer = window.setTimeout(() => {
+      dragEndTimer = undefined
+      if (dragging.value || busy.value) return
+      if (!shellEl.value?.matches(':hover')) collapse()
+    }, 420)
+  })
 })
 
 onBeforeUnmount(() => {
   if (leaveTimer) window.clearTimeout(leaveTimer)
+  if (dragEndTimer) window.clearTimeout(dragEndTimer)
   offCollapse?.()
   offDock?.()
+  offDragEnd?.()
 })
 
 function cancelLeave() {
@@ -57,17 +72,38 @@ function cancelLeave() {
   }
 }
 
+function cancelDragEndCheck() {
+  if (dragEndTimer) {
+    window.clearTimeout(dragEndTimer)
+    dragEndTimer = undefined
+  }
+}
+
+function ensureExpanded(): Promise<boolean> {
+  if (expandTask) return expandTask
+  if (expanded.value) return Promise.resolve(true)
+  expanded.value = true
+  let task: Promise<boolean>
+  task = call('main.EdgeService.SetExpanded', true)
+    .then(() => true)
+    .catch(() => {
+      expanded.value = false
+      return false
+    })
+    .finally(() => {
+      if (expandTask === task) expandTask = null
+    })
+  expandTask = task
+  return task
+}
+
 async function onEnter() {
   if (dragging.value) return
   cancelLeave()
+  cancelDragEndCheck()
   loadConfig()
   if (expanded.value) return
-  expanded.value = true
-  try {
-    await call('main.EdgeService.SetExpanded', true)
-  } catch {
-    expanded.value = false
-  }
+  await ensureExpanded()
 }
 
 function scheduleCollapse() {
@@ -113,77 +149,80 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
+function releaseCapture() {
+  if (captureEl && pointerId !== null) {
+    try {
+      captureEl.releasePointerCapture(pointerId)
+    } catch {
+      /* 原生拖窗已接管鼠标时捕获可能已被系统释放 */
+    }
+  }
+  captureEl = null
+}
+
+function endDragState() {
+  releaseCapture()
+  pointerId = null
+  dragArmed = false
+  dragging.value = false
+}
+
 function onPointerDown(e: PointerEvent) {
   if (e.button !== 0 || pointerId !== null) return
+  cancelDragEndCheck()
   pointerId = e.pointerId
-  startX = lastX = e.screenX
-  startY = lastY = e.screenY
-  dragMoved = false
-  dragReady = false
-  endAfterBegin = null
+  captureEl = e.currentTarget as HTMLElement
+  startX = e.screenX
+  startY = e.screenY
+  dragArmed = false
   try {
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    captureEl.setPointerCapture(e.pointerId)
   } catch {
     /* 合成事件可能没有活跃指针，仍由元素直接接收后续事件 */
   }
 }
 
-// BeginDrag 会先把窗口展开，等它完成后再送移动/结束，避免极快拖动时后端乱序。
-async function startDrag() {
-  try {
-    await call('main.EdgeService.BeginDrag', startX, startY)
-    dragReady = true
-    if (endAfterBegin) {
-      const end = endAfterBegin
-      endAfterBegin = null
-      dragReady = false
-      await call('main.EdgeService.EndDrag', end.x, end.y)
-      return
-    }
-    await call('main.EdgeService.DragTo', lastX, lastY)
-  } catch {
-    dragReady = false
-  }
-}
-
-function endDragAt(x: number, y: number) {
-  if (!dragReady) {
-    endAfterBegin = { x, y }
+// 超过阈值后把拖窗交给系统：窗口由 OS 直接搬运，避免逐帧同步 IPC 造成的卡顿。
+async function beginNativeDrag() {
+  const ok = await ensureExpanded()
+  if (!ok || pointerId === null) {
+    endDragState()
     return
   }
-  dragReady = false
-  void call('main.EdgeService.EndDrag', x, y)
+  try {
+    await call('main.EdgeService.BeginDrag')
+  } catch {
+    endDragState()
+    return
+  }
+  if (pointerId === null) {
+    void call('main.EdgeService.EndDrag')
+    endDragState()
+    return
+  }
+  // 保留指针捕获：Windows 端 Wails 需要先 ReleaseCapture 才能进入系统拖窗循环。
+  startNativeDrag()
 }
 
 function onPointerMove(e: PointerEvent) {
-  if (pointerId === null || e.pointerId !== pointerId) return
-  lastX = e.screenX
-  lastY = e.screenY
-  if (!dragMoved) {
-    if (Math.hypot(e.screenX - startX, e.screenY - startY) < 4) return
-    dragMoved = true
-    dragging.value = true
-    expanded.value = true
-    cancelLeave()
-    void startDrag()
-    return
-  }
-  if (dragReady) void call('main.EdgeService.DragTo', e.screenX, e.screenY)
+  if (pointerId === null || e.pointerId !== pointerId || dragArmed) return
+  if (Math.hypot(e.screenX - startX, e.screenY - startY) < 4) return
+  dragArmed = true
+  dragging.value = true
+  cancelLeave()
+  void beginNativeDrag()
 }
 
 function finishPointer(e: PointerEvent) {
   if (pointerId === null || e.pointerId !== pointerId) return
-  const wasDragging = dragMoved
+  const wasArmed = dragArmed
+  releaseCapture()
   pointerId = null
-  dragMoved = false
-  try {
-    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
-  } catch {
-    /* ignore */
-  }
-  if (wasDragging) {
+  dragArmed = false
+  if (wasArmed) {
     dragging.value = false
-    endDragAt(lastX, lastY)
+    // Windows 收不到这里的 pointerup，会由 WindowEndMove 收尾；macOS 则依赖这次调用。
+    void call('main.EdgeService.EndDrag')
     return
   }
   report()
@@ -191,15 +230,18 @@ function finishPointer(e: PointerEvent) {
 
 function onPointerCancel(e: PointerEvent) {
   if (pointerId === null || e.pointerId !== pointerId) return
-  if (dragMoved) endDragAt(lastX, lastY)
+  const wasArmed = dragArmed
+  releaseCapture()
   pointerId = null
-  dragMoved = false
+  dragArmed = false
   dragging.value = false
+  if (wasArmed) void call('main.EdgeService.EndDrag')
 }
 </script>
 
 <template>
   <div
+    ref="shellEl"
     class="edge-shell"
     :class="['dock-' + dock, { expanded, busy, dragging }]"
     role="button"
@@ -315,6 +357,7 @@ html, body, #app {
   width: 100vw;
   height: 100vh;
   display: flex;
+  -webkit-user-select: none;
   user-select: none;
   font-family: var(--rf-sans);
   cursor: pointer;
@@ -325,6 +368,13 @@ html, body, #app {
 .edge-shell.dock-top { align-items: flex-start; justify-content: center; }
 .edge-shell.dock-bottom { align-items: flex-end; justify-content: center; }
 .edge-shell.dragging { cursor: grabbing; }
+.edge-shell.dragging * { cursor: grabbing; }
+/* 系统拖窗时窗口内容通常不重绘，暂停装饰动画减少合成开销。 */
+.edge-shell.dragging .pet-card { animation: none; }
+.edge-shell.dragging .pet-bug,
+.edge-shell.dragging .antennae,
+.edge-shell.dragging .eyes,
+.edge-shell.dragging .sparkles { animation-play-state: paused; }
 .edge-shell:focus-visible .pet-card { outline: 1px solid var(--rf-accent); outline-offset: 2px; }
 
 .edge-tab {

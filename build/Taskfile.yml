@@ -51,7 +51,7 @@ tasks:
     generates:
       - windows/icon.ico
     cmds:
-      - wails3 generate icons -input appicon.png -windowsfilename windows/icon.ico -macfilename darwin/icon.icns
+      - wails3 generate icons -input appicon.png -windowsfilename windows/icon.ico -macfilename darwin/icons.icns
 
   update:build-assets:
     summary: Update generated build assets from build/config.yml

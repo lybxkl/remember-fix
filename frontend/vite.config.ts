@@ -10,7 +10,8 @@ export default defineConfig({
   clearScreen: false,
   server: { port: 5178, strictPort: true },
   build: {
-    target: 'chrome110',
+    // macOS 12 的 WKWebView 基线是 Safari 15，不能只按 Chrome 版本降级。
+    target: 'safari15',
     chunkSizeWarningLimit: 1600,
     rollupOptions: {
       input: {

@@ -5,6 +5,7 @@ import {
   Activity, Copy, Database, FolderOpen, Keyboard, PanelRight, PlugZap, Rocket, X,
 } from 'lucide-vue-next'
 import { useSettings } from '../composables/useSettings'
+import { defaultHotkey, hotkeyExample } from '../lib/platform'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
@@ -37,7 +38,7 @@ watch(
     form.baseURL = settings.value['ai.baseURL'] ?? ''
     form.apiKey = settings.value['ai.apiKey'] ?? ''
     form.model = settings.value['ai.model'] ?? ''
-    form.hotkey = settings.value.hotkey ?? 'Ctrl+Alt+R'
+    form.hotkey = settings.value.hotkey ?? defaultHotkey
     aiEnabled.value = (settings.value['ai.enabled'] ?? 'true') === 'true'
     autoStart.value = settings.value.autostart === 'true'
     edgeEnabled.value = (settings.value['edge.enabled'] ?? 'true') === 'true'
@@ -198,8 +199,8 @@ async function onOpenDataDir() {
         </div>
         <div class="field inline">
           <label>热键</label>
-          <el-input v-model="form.hotkey" placeholder="Ctrl+Alt+R" style="width: 220px" />
-          <span class="field-hint inline">例如 Ctrl+Alt+R / Ctrl+Shift+Space</span>
+          <el-input v-model="form.hotkey" :placeholder="defaultHotkey" style="width: 220px" />
+          <span class="field-hint inline">例如 {{ hotkeyExample }}</span>
         </div>
       </section>
 
@@ -241,7 +242,7 @@ async function onOpenDataDir() {
           <span class="group-icon"><Rocket :size="14" /></span>
           <div>
             <div class="group-title">启动</div>
-            <div class="group-sub">登录 Windows 后自动在托盘待命</div>
+            <div class="group-sub">登录系统后自动启动</div>
           </div>
           <span class="spacer" />
           <el-switch v-model="autoStart" />

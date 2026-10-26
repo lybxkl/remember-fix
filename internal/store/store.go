@@ -20,7 +20,6 @@ type Store struct {
 const (
 	DefaultAIBaseURL = "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
 	DefaultAIModel   = "qwen3.8-max"
-	DefaultHotkey    = "Ctrl+Alt+R"
 )
 
 func Open(dataDir string) (*Store, error) {

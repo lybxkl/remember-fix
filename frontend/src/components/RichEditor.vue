@@ -11,6 +11,7 @@ import {
   Bold, Italic, Strikethrough, Code, Heading2, List, ListOrdered,
   CodeXml, ImagePlus, Table2, Minus, Undo2, Redo2,
 } from 'lucide-vue-next'
+import { modName } from '../lib/platform'
 
 const props = defineProps<{
   modelValue: string
@@ -74,8 +75,8 @@ defineExpose({ insertImage, focus })
 <template>
   <div class="rf-editor">
     <div class="rf-toolbar">
-      <button title="加粗 Ctrl+B" @click.prevent="editor?.chain().focus().toggleBold().run()"><Bold :size="14" /></button>
-      <button title="斜体 Ctrl+I" @click.prevent="editor?.chain().focus().toggleItalic().run()"><Italic :size="14" /></button>
+      <button :title="`加粗 ${modName}+B`" @click.prevent="editor?.chain().focus().toggleBold().run()"><Bold :size="14" /></button>
+      <button :title="`斜体 ${modName}+I`" @click.prevent="editor?.chain().focus().toggleItalic().run()"><Italic :size="14" /></button>
       <button title="删除线" @click.prevent="editor?.chain().focus().toggleStrike().run()"><Strikethrough :size="14" /></button>
       <button title="行内代码" @click.prevent="editor?.chain().focus().toggleCode().run()"><Code :size="14" /></button>
       <span class="rf-sep" />
@@ -89,8 +90,8 @@ defineExpose({ insertImage, focus })
       <span class="rf-sep" />
       <button title="插入当前截图" @click.prevent="$emit('insert-shot')"><ImagePlus :size="14" /></button>
       <span class="rf-flex" />
-      <button title="撤销 Ctrl+Z" @click.prevent="editor?.chain().focus().undo().run()"><Undo2 :size="14" /></button>
-      <button title="重做 Ctrl+Shift+Z" @click.prevent="editor?.chain().focus().redo().run()"><Redo2 :size="14" /></button>
+      <button :title="`撤销 ${modName}+Z`" @click.prevent="editor?.chain().focus().undo().run()"><Undo2 :size="14" /></button>
+      <button :title="`重做 ${modName}+Shift+Z`" @click.prevent="editor?.chain().focus().redo().run()"><Redo2 :size="14" /></button>
     </div>
     <div class="rf-editor-body" :style="{ minHeight: (minHeight ?? 90) + 'px' }">
       <div v-if="placeholder && empty" class="rf-placeholder">{{ placeholder }}</div>

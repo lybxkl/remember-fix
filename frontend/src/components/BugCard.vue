@@ -96,6 +96,7 @@ function onDragStart(e: DragEvent) {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  -webkit-user-select: none;
   user-select: none;
   transition: border-color .15s ease, background .15s ease, transform .12s ease, box-shadow .15s ease;
   animation: card-in .24s ease both;
@@ -129,7 +130,8 @@ function onDragStart(e: DragEvent) {
   font-size: 9.5px;
   font-weight: 700;
   color: var(--sev);
-  border: 1px solid color-mix(in srgb, var(--sev) 45%, transparent);
+  border: 1px solid var(--sev);
+  border-color: color-mix(in srgb, var(--sev) 45%, transparent);
   border-radius: 4px;
   padding: 0 4px;
   line-height: 15px;
@@ -193,6 +195,7 @@ function onDragStart(e: DragEvent) {
   background: rgba(58, 49, 38, .66);
   border-radius: 4px;
   padding: 1px 5px;
+  -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
 }
 .card-tags { display: flex; gap: 4px; flex-wrap: wrap; }

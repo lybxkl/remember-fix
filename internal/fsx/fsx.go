@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// DataDir 返回应用数据目录（%AppData%/remember-fix），确保 shots 子目录存在。
+// DataDir 返回应用数据目录（os.UserConfigDir()/remember-fix；Windows 为 %AppData%，macOS 为 ~/Library/Application Support），确保 shots 子目录存在。
 func DataDir() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {

@@ -8,6 +8,7 @@ import { call, onEvent } from '../lib/wails'
 import type { Bug } from '../lib/types'
 import { CATEGORIES, SEVERITIES, SEVERITY_META, STATUS_COLUMNS, categoryLabel, formatTime } from '../lib/constants'
 import { renderMarkdown } from '../lib/markdown'
+import { modSymbol } from '../lib/platform'
 
 const props = defineProps<{ bugId: string }>()
 const emit = defineEmits<{ (e: 'close'): void; (e: 'saved'): void }>()
@@ -234,7 +235,7 @@ async function copyFixPrompt() {
 
         <div class="section-head">
           <span class="section-label">描述</span>
-          <span class="section-hint">Ctrl+S 保存</span>
+          <span class="section-hint">{{ modSymbol }}+S 保存</span>
         </div>
         <RichEditor
           ref="editorRef"

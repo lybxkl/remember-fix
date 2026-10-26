@@ -1,0 +1,95 @@
+version: '3'
+
+includes:
+  common: ../Taskfile.yml
+
+vars:
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+tasks:
+  build:
+    summary: Builds the application for macOS
+    cmds:
+      - task: build:native
+        vars:
+          ARCH: '{{.ARCH}}'
+          DEV: '{{.DEV}}'
+          EXTRA_TAGS: '{{.EXTRA_TAGS}}'
+
+  build:native:
+    summary: Build a macOS binary
+    internal: true
+    deps:
+      - task: common:go:mod:tidy
+      - task: common:build:frontend
+      - task: common:generate:icons
+    cmds:
+      - 'go build {{.BUILD_FLAGS}} -o "{{.OUTPUT}}"'
+    vars:
+      BUILD_FLAGS: '{{if eq .DEV "true"}}-tags private_mac_apis{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -buildvcs=false -gcflags=all="-l"{{else}}-tags production,private_mac_apis{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s"{{end}}'
+      DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
+      OUTPUT: '{{.OUTPUT | default .DEFAULT_OUTPUT}}'
+    env:
+      GOOS: darwin
+      CGO_ENABLED: '1'
+      GOARCH: '{{.ARCH}}'
+      CGO_CFLAGS: "-mmacosx-version-min={{.MACOSX_DEPLOYMENT_TARGET}}"
+      CGO_LDFLAGS: "-mmacosx-version-min={{.MACOSX_DEPLOYMENT_TARGET}}"
+      MACOSX_DEPLOYMENT_TARGET: "{{.MACOSX_DEPLOYMENT_TARGET}}"
+
+  package:
+    summary: Builds and packages a macOS .app bundle
+    deps:
+      - task: build
+    cmds:
+      - task: create:app:bundle
+
+  package:universal:
+    summary: Builds and packages a universal macOS .app bundle (Intel + Apple Silicon)
+    deps:
+      - task: build:universal
+    cmds:
+      - task: create:app:bundle
+
+  build:universal:
+    summary: Builds a universal macOS binary (Intel + Apple Silicon)
+    deps:
+      - task: common:go:mod:tidy
+      - task: common:build:frontend
+      - task: common:generate:icons
+    cmds:
+      - task: build:native
+        vars:
+          ARCH: amd64
+          OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}-amd64'
+      - task: build:native
+        vars:
+          ARCH: arm64
+          OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}-arm64'
+      - rm -f "{{.BIN_DIR}}/{{.APP_NAME}}"
+      - lipo -create -output "{{.BIN_DIR}}/{{.APP_NAME}}" "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+      - rm -f "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+
+  create:app:bundle:
+    summary: Creates the .app bundle
+    cmds:
+      - rm -rf "{{.BIN_DIR}}/{{.APP_NAME}}.app"
+      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS"
+      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources"
+      - cp build/darwin/icons.icns "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources"
+      - cp "{{.BIN_DIR}}/{{.APP_NAME}}" "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS"
+      - cp build/darwin/Info.plist "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents"
+      - xattr -cr "{{.BIN_DIR}}/{{.APP_NAME}}.app"
+      - codesign --force --deep --sign - "{{.BIN_DIR}}/{{.APP_NAME}}.app"
+
+  run:
+    summary: Runs the built app bundle (use after wails3 build)
+    cmds:
+      - rm -rf "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app"
+      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/MacOS"
+      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Resources"
+      - cp build/darwin/icons.icns "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Resources"
+      - cp "{{.BIN_DIR}}/{{.APP_NAME}}" "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/MacOS"
+      - cp build/darwin/Info.dev.plist "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Info.plist"
+      - codesign --force --deep --sign - "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app"
+      - '"{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/MacOS/{{.APP_NAME}}"'

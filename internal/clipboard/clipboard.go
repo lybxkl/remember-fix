@@ -1,7 +1,7 @@
 package clipboard
 
 // Clipboard 抽象系统剪贴板能力，供捕获器使用。
-// Windows 实现见 windows.go；未来跨平台时在此接口下新增实现。
+// Windows 实现见 windows.go，macOS 实现见 clipboard_darwin.go。
 type Clipboard interface {
 	// Text 读取剪贴板文本（无文本时 ok=false）。
 	Text() (text string, ok bool)
