@@ -16,22 +16,29 @@ const { bugs, error, load, updateStatus } = useBugs()
 const keyword = ref('')
 const filterCategory = ref('')
 const filterSeverity = ref('')
+const onlyPending = ref(false)
 const drawerId = ref('')
 const settingsOpen = ref(false)
 const hotkey = ref(defaultHotkey)
 const loaded = ref(false)
 const searchRef = ref<HTMLInputElement>()
 let offSettings: (() => void) | undefined
+let offPending: (() => void) | undefined
 
 onMounted(async () => {
   offSettings = onEvent('ui:open-settings', () => {
     settingsOpen.value = true
+  })
+  offPending = onEvent('ui:open-pending', () => {
+    clearFilters()
+    onlyPending.value = true
   })
   window.addEventListener('keydown', onKeydown)
   await initialLoad()
 })
 onBeforeUnmount(() => {
   offSettings?.()
+  offPending?.()
   window.removeEventListener('keydown', onKeydown)
 })
 
@@ -54,6 +61,7 @@ async function loadHotkey() {
 const filtered = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
   return bugs.value.filter((b) => {
+    if (onlyPending.value && b.status !== 'todo' && b.status !== 'doing') return false
     if (filterCategory.value && b.category !== filterCategory.value) return false
     if (filterSeverity.value && b.severity !== filterSeverity.value) return false
     if (!kw) return true
@@ -70,7 +78,7 @@ const byStatus = computed(() => {
 })
 
 const activeFilters = computed(
-  () => !!keyword.value.trim() || !!filterCategory.value || !!filterSeverity.value,
+  () => onlyPending.value || !!keyword.value.trim() || !!filterCategory.value || !!filterSeverity.value,
 )
 
 const stats = computed(() => {
@@ -90,6 +98,7 @@ function clearFilters() {
   keyword.value = ''
   filterCategory.value = ''
   filterSeverity.value = ''
+  onlyPending.value = false
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -198,6 +207,15 @@ function onSettingsClose() {
       <el-select v-model="filterSeverity" placeholder="全部严重度" clearable style="width: 122px">
         <el-option v-for="s in SEVERITIES" :key="s" :value="s" :label="s" />
       </el-select>
+      <button
+        v-if="onlyPending"
+        class="pending-filter"
+        title="移除待处理筛选"
+        @click="onlyPending = false"
+      >
+        只看待处理
+        <X :size="11" />
+      </button>
       <button v-if="activeFilters" class="clear-filters" @click="clearFilters">清除筛选</button>
       <span class="filter-spacer" />
       <span v-if="activeFilters" class="result-count">{{ filtered.length }} 条匹配</span>
@@ -371,6 +389,19 @@ function onSettingsClose() {
   border-radius: 5px;
 }
 .clear-filters:hover { color: var(--rf-text); background: var(--rf-card); }
+.pending-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgba(168, 99, 19, 0.3);
+  background: var(--rf-accent-soft);
+  color: var(--rf-accent);
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.pending-filter:hover { border-color: var(--rf-accent); }
 .filter-spacer { flex: 1; }
 .result-count { font-family: var(--rf-mono); font-size: 10px; color: var(--rf-text-dim); }
 .hotkey-hint { font-size: 10px; color: var(--rf-text-faint); display: flex; align-items: center; gap: 4px; margin-left: 10px; }

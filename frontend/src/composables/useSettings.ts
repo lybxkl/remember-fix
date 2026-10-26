@@ -32,6 +32,11 @@ export function useSettings() {
     await load()
   }
 
+  async function setEdgeReminderEnabled(enabled: boolean) {
+    await call('main.ConfigService.SetEdgeReminderEnabled', enabled)
+    await load()
+  }
+
   async function openDataDir() {
     await call('main.ConfigService.OpenDataDir')
   }
@@ -49,7 +54,7 @@ export function useSettings() {
   }
 
   return {
-    settings, load, save, testAI, setHotkey, setAutostart, setEdgeEnabled,
+    settings, load, save, testAI, setHotkey, setAutostart, setEdgeEnabled, setEdgeReminderEnabled,
     openDataDir, exportMarkdown, analyzeAll, copyText,
   }
 }

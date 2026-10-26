@@ -52,8 +52,9 @@ func main() {
 	})
 	capSvc := &CaptureService{capturer: capturer, shell: shell}
 	shell.trigger = capSvc.Trigger
-	bugSvc := &BugService{store: st, dataDir: dataDir}
-	cfgSvc := &ConfigService{store: st, shell: shell}
+	reminders := newReminderScheduler(st, shell)
+	bugSvc := &BugService{store: st, dataDir: dataDir, reminders: reminders}
+	cfgSvc := &ConfigService{store: st, shell: shell, reminders: reminders}
 	edgeSvc := &EdgeService{shell: shell, store: st}
 
 	var browserArgs []string
@@ -88,6 +89,7 @@ func main() {
 			},
 		},
 		OnShutdown: func() {
+			reminders.Stop()
 			capturer.Stop()
 			_ = st.Close()
 		},
@@ -96,6 +98,9 @@ func main() {
 
 	setupWindows(app, shell)
 	setupTray(app, capSvc, shell)
+	app.Event.RegisterApplicationEventHook(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		reminders.Start()
+	})
 	if runtime.GOOS == "darwin" {
 		setupMacMenu(app, capSvc, shell)
 		// 点击 Dock 图标时把主窗重新叫出来（macOS 的 reopen 事件）。

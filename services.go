@@ -422,11 +422,33 @@ func (s *EdgeService) Trigger() error {
 	return nil
 }
 
+// ReminderState 返回贴边窗挂载时所需的待处理摘要。
+func (s *EdgeService) ReminderState() (ReminderState, error) {
+	if s.store == nil {
+		return ReminderState{}, errors.New("数据尚未就绪")
+	}
+	return pendingSummary(s.store)
+}
+
+// OpenBoard 收起宠物并打开主窗，切换到「只看待处理」筛选。
+func (s *EdgeService) OpenBoard() error {
+	if s.shell == nil {
+		return errors.New("应用尚未就绪")
+	}
+	s.shell.resetEdgeDrag()
+	s.shell.layoutEdge(false)
+	emit("edge:collapse", nil)
+	s.shell.ShowMain()
+	emit("ui:open-pending", nil)
+	return nil
+}
+
 // ─── Bug 服务 ───
 
 type BugService struct {
 	store     *store.Store
 	dataDir   string
+	reminders *ReminderScheduler
 	analyzing sync.Map // id -> struct{}，避免同一条记录并发分析
 }
 
@@ -457,6 +479,7 @@ func (s *BugService) Save(b *models.Bug) (*models.Bug, error) {
 		return b, nil
 	}
 	emit("bug:changed", saved)
+	s.refreshReminders()
 	if isNew {
 		go s.analyzeAsync(saved.ID)
 	}
@@ -477,6 +500,7 @@ func (s *BugService) UpdateStatus(id, status string) error {
 	if b, err := s.store.GetBug(id); err == nil {
 		emit("bug:changed", b)
 	}
+	s.refreshReminders()
 	return nil
 }
 
@@ -485,7 +509,14 @@ func (s *BugService) Delete(id string) error {
 		return err
 	}
 	emit("bug:deleted", map[string]string{"id": id})
+	s.refreshReminders()
 	return nil
+}
+
+func (s *BugService) refreshReminders() {
+	if s.reminders != nil {
+		s.reminders.Refresh()
+	}
 }
 
 // Reanalyze 手动重新触发 AI 分析。
@@ -685,8 +716,9 @@ func fallbackTitle(b *models.Bug) string {
 // ─── 配置服务 ───
 
 type ConfigService struct {
-	store *store.Store
-	shell *AppShell
+	store     *store.Store
+	shell     *AppShell
+	reminders *ReminderScheduler
 }
 
 func (s *ConfigService) GetAll() map[string]string {
@@ -701,6 +733,9 @@ func (s *ConfigService) GetAll() map[string]string {
 			dock = "right"
 		}
 		cfg["edge.dock"] = dock
+	}
+	if _, ok := cfg[reminderEnabledKey]; !ok {
+		cfg[reminderEnabledKey] = "true"
 	}
 	return cfg
 }
@@ -739,6 +774,17 @@ func (s *ConfigService) SetEdgeEnabled(enabled bool) error {
 		return err
 	}
 	s.shell.SetEdgeEnabled(enabled)
+	return nil
+}
+
+// SetEdgeReminderEnabled 关闭后停止定时脉冲，徽标仍随待处理数量更新。
+func (s *ConfigService) SetEdgeReminderEnabled(enabled bool) error {
+	if err := s.store.SetSetting(reminderEnabledKey, strconv.FormatBool(enabled)); err != nil {
+		return err
+	}
+	if s.reminders != nil {
+		s.reminders.SetEnabled(enabled)
+	}
 	return nil
 }
 

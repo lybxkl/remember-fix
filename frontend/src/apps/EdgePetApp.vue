@@ -1,9 +1,15 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { call, onEvent, startNativeDrag } from '../lib/wails'
 import { defaultHotkey } from '../lib/platform'
 
 type Dock = 'right' | 'left' | 'top' | 'bottom'
+
+interface ReminderState {
+  pending?: number
+  oldestDays?: number
+  pulse?: boolean
+}
 
 const DOCKS: Dock[] = ['right', 'left', 'top', 'bottom']
 const expanded = ref(false)
@@ -11,12 +17,19 @@ const busy = ref(false)
 const dragging = ref(false)
 const dock = ref<Dock>('right')
 const hotkey = ref(defaultHotkey)
+const pending = ref(0)
+const oldestDays = ref(0)
+const pulsing = ref(false)
 const shellEl = ref<HTMLElement | null>(null)
 let leaveTimer: number | undefined
 let dragEndTimer: number | undefined
+let pulseTimer: number | undefined
+let pulseFrame: number | undefined
+let reminderEventSeen = false
 let offCollapse: (() => void) | undefined
 let offDock: (() => void) | undefined
 let offDragEnd: (() => void) | undefined
+let offReminder: (() => void) | undefined
 let pointerId: number | null = null
 let captureEl: HTMLElement | null = null
 let startX = 0
@@ -26,6 +39,65 @@ let expandTask: Promise<boolean> | null = null
 
 function isDock(value: unknown): value is Dock {
   return typeof value === 'string' && (DOCKS as string[]).includes(value)
+}
+
+const hasPending = computed(() => pending.value > 0)
+const badgeLabel = computed(() => (pending.value > 9 ? '9+' : String(pending.value)))
+const reminderSub = computed(() =>
+  oldestDays.value > 0 ? `最久的一条 ${oldestDays.value} 天了` : '都是今天刚记的',
+)
+const recordLabel = computed(() =>
+  hasPending.value
+    ? `${pending.value} 条待处理；点击记一条 Bug，按住可拖动位置`
+    : '记一条 Bug，按住可拖动调整位置',
+)
+const announcement = computed(() => {
+  if (!hasPending.value) return '没有待处理记录'
+  return oldestDays.value > 0
+    ? `${pending.value} 条待处理，最久 ${oldestDays.value} 天`
+    : `${pending.value} 条待处理，都是今天记的`
+})
+
+function applyReminder(data: ReminderState | null) {
+  if (!data) return
+  const count = Number(data.pending)
+  const age = Number(data.oldestDays)
+  pending.value = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
+  oldestDays.value = Number.isFinite(age) && age > 0 ? Math.floor(age) : 0
+  if (!hasPending.value) {
+    if (pulseTimer) window.clearTimeout(pulseTimer)
+    if (pulseFrame) window.cancelAnimationFrame(pulseFrame)
+    pulseTimer = undefined
+    pulseFrame = undefined
+    pulsing.value = false
+  } else if (data.pulse) {
+    playPulse()
+  }
+}
+
+function playPulse() {
+  if (pulseTimer) window.clearTimeout(pulseTimer)
+  if (pulseFrame) window.cancelAnimationFrame(pulseFrame)
+  pulsing.value = false
+  // 同一帧里先移除再加回 class 不会重播动画。
+  pulseFrame = window.requestAnimationFrame(() => {
+    pulseFrame = undefined
+    pulsing.value = true
+    pulseTimer = window.setTimeout(() => {
+      pulsing.value = false
+      pulseTimer = undefined
+    }, 2300)
+  })
+}
+
+async function loadReminder() {
+  try {
+    const state = await call<ReminderState>('main.EdgeService.ReminderState')
+    // 挂载期间如果已有新事件到达，以事件为准，避免旧请求覆盖新状态。
+    if (!reminderEventSeen) applyReminder(state)
+  } catch {
+    /* 保持无待处理显示 */
+  }
 }
 
 async function loadConfig() {
@@ -40,9 +112,14 @@ async function loadConfig() {
 
 onMounted(() => {
   loadConfig()
+  loadReminder()
   offCollapse = onEvent('edge:collapse', () => { expanded.value = false })
   offDock = onEvent<unknown>('edge:dock', (value) => {
     if (isDock(value)) dock.value = value
+  })
+  offReminder = onEvent<ReminderState | null>('edge:reminder', (data) => {
+    reminderEventSeen = true
+    applyReminder(data)
   })
   // Windows 原生拖动期间 WebView 收不到 pointerup，由后端吸附完成后通知复位。
   offDragEnd = onEvent('edge:drag-end', () => {
@@ -60,9 +137,12 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (leaveTimer) window.clearTimeout(leaveTimer)
   if (dragEndTimer) window.clearTimeout(dragEndTimer)
+  if (pulseTimer) window.clearTimeout(pulseTimer)
+  if (pulseFrame) window.cancelAnimationFrame(pulseFrame)
   offCollapse?.()
   offDock?.()
   offDragEnd?.()
+  offReminder?.()
 })
 
 function cancelLeave() {
@@ -137,6 +217,15 @@ async function report() {
     }
   } finally {
     window.setTimeout(() => { busy.value = false }, 500)
+  }
+}
+
+async function openBoard() {
+  cancelLeave()
+  try {
+    await call('main.EdgeService.OpenBoard')
+  } catch {
+    /* 主窗尚未就绪 */
   }
 }
 
@@ -243,25 +332,28 @@ function onPointerCancel(e: PointerEvent) {
   <div
     ref="shellEl"
     class="edge-shell"
-    :class="['dock-' + dock, { expanded, busy, dragging }]"
-    role="button"
-    tabindex="0"
-    title="点击记一条 Bug，按住可拖动位置"
-    aria-label="记一条 Bug，按住可拖动调整位置"
+    :class="['dock-' + dock, { expanded, busy, dragging, pulsing, 'has-pending': hasPending }]"
     @mouseenter="onEnter"
     @mouseleave="scheduleCollapse"
     @pointerdown="onPointerDown"
     @pointermove="onPointerMove"
     @pointerup="finishPointer"
     @pointercancel="onPointerCancel"
-    @keydown="onKey"
   >
+    <span class="sr-only" aria-live="polite">{{ announcement }}</span>
     <div v-if="expanded" class="pet-card">
-      <div class="pet-bubble">
-        <span class="bubble-kicker">REMEMBER / FIX</span>
-        <strong>又发现 Bug 了？</strong>
-        <span class="bubble-sub">点一下，把刚遇到的情况记下来</span>
-      </div>
+      <div
+        class="pet-record"
+        role="button"
+        tabindex="0"
+        :aria-label="recordLabel"
+        @keydown="onKey"
+      >
+        <div class="pet-bubble">
+          <span class="bubble-kicker">{{ hasPending ? 'REMINDER / 待处理' : 'REMEMBER / FIX' }}</span>
+          <strong>{{ hasPending ? `${pending} 条还挂着` : '又发现 Bug 了？' }}</strong>
+          <span class="bubble-sub">{{ hasPending ? reminderSub : '点一下，把刚遇到的情况记下来' }}</span>
+        </div>
 
       <div class="pet-stage" aria-hidden="true">
         <svg class="pet-svg" viewBox="0 0 170 136" fill="none">
@@ -325,15 +417,36 @@ function onPointerCancel(e: PointerEvent) {
         </svg>
       </div>
 
-      <div class="pet-cta">
-        <span>{{ busy ? '正在打开…' : '点我记一条' }}</span>
-        <kbd>{{ hotkey }}</kbd>
+        <div class="pet-cta">
+          <span>{{ busy ? '正在打开…' : '点我记一条' }}</span>
+          <kbd>{{ hotkey }}</kbd>
+        </div>
+        <span class="pet-hint">自动带上剪贴板截图 / 文本</span>
       </div>
-      <span class="pet-hint">自动带上剪贴板截图 / 文本</span>
+      <button
+        v-if="hasPending"
+        type="button"
+        class="bubble-link"
+        title="打开看板，只看待处理"
+        @pointerdown.stop
+        @pointerup.stop
+        @click.stop="openBoard"
+      >
+        看板 →
+      </button>
     </div>
 
-    <div v-else class="edge-tab" aria-hidden="true">
-      <svg viewBox="0 0 20 26" fill="none">
+    <div
+      v-else
+      class="edge-tab"
+      role="button"
+      tabindex="0"
+      :aria-label="recordLabel"
+      title="点击记一条 Bug，按住可拖动位置"
+      @keydown="onKey"
+    >
+      <span v-if="hasPending" class="edge-badge" aria-hidden="true">{{ badgeLabel }}</span>
+      <svg viewBox="0 0 20 26" fill="none" aria-hidden="true">
         <g stroke="#fff8ea" stroke-width="1.35" stroke-linecap="round">
           <path d="M7 6 4.5 3.5M13 6 15.5 3.5" />
           <path d="M4.2 12.5H1.8M4.2 18H1.6M15.8 12.5h2.4M15.8 18h2.6" />
@@ -375,7 +488,18 @@ html, body, #app {
 .edge-shell.dragging .antennae,
 .edge-shell.dragging .eyes,
 .edge-shell.dragging .sparkles { animation-play-state: paused; }
-.edge-shell:focus-visible .pet-card { outline: 1px solid var(--rf-accent); outline-offset: 2px; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+.edge-tab:focus-visible { outline: 1px solid var(--rf-accent); outline-offset: 2px; }
 
 .edge-tab {
   position: relative;
@@ -411,23 +535,87 @@ html, body, #app {
 .edge-tab svg { width: 13px; height: 17px; filter: drop-shadow(0 1px 1px rgba(60, 37, 8, 0.25)); }
 .edge-shell:hover .edge-tab { filter: brightness(1.08); }
 
+/* 徽标只叠在 24px 收起标签内，不改变窗口尺寸。 */
+.edge-badge {
+  position: absolute;
+  z-index: 3;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 2px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  border: 1px solid rgba(168, 99, 19, 0.42);
+  background: #fff8ea;
+  color: var(--rf-accent-strong);
+  font-family: var(--rf-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  line-height: 12px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 2px 7px rgba(76, 62, 43, 0.2);
+  pointer-events: none;
+}
+.edge-shell.dock-right .edge-badge { top: 1px; left: 2px; }
+.edge-shell.dock-left .edge-badge { top: 1px; right: 2px; }
+.edge-shell.dock-top .edge-badge { top: 1px; right: 2px; }
+.edge-shell.dock-bottom .edge-badge { bottom: 1px; right: 2px; }
+
+.edge-tab::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: inherit;
+  border: 1px solid rgba(255, 248, 234, 0.85);
+  opacity: 0;
+  pointer-events: none;
+}
+.edge-shell.pulsing .edge-tab::after { animation: tab-ping 2s ease-out 1; }
+.edge-shell.pulsing .edge-badge { animation: badge-pop 2.2s cubic-bezier(.2, .8, .2, 1) 1; }
+
 .pet-card {
   box-sizing: border-box;
   width: 184px;
   height: 232px;
   flex-shrink: 0;
-  padding: 12px 12px 10px;
   border-radius: 18px;
   border: 1px solid var(--rf-border);
   background: linear-gradient(180deg, #fffdf9 0%, #faf5ea 100%);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
   overflow: hidden;
   position: relative;
   animation: card-in .18s cubic-bezier(.2, .8, .2, 1);
 }
+.pet-record {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 12px 12px 10px;
+  border-radius: 17px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  cursor: pointer;
+}
+.pet-record:focus-visible { outline: 1px solid var(--rf-accent); outline-offset: -3px; }
+.bubble-link {
+  position: absolute;
+  top: 8px;
+  right: 9px;
+  z-index: 3;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--rf-accent);
+  font-family: var(--rf-sans);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.bubble-link:hover { background: rgba(168, 99, 19, 0.1); text-decoration: underline; text-underline-offset: 2px; }
+.bubble-link:focus-visible { outline: 1px solid var(--rf-accent); outline-offset: 1px; }
 .pet-card::before {
   content: '';
   position: absolute;
@@ -517,5 +705,26 @@ html, body, #app {
 @keyframes sparkle {
   0%, 100% { opacity: .35; }
   50% { opacity: .9; }
+}
+@keyframes tab-ping {
+  0% { opacity: .9; transform: scale(.8); }
+  70% { opacity: 0; transform: scale(1.25); }
+  100% { opacity: 0; transform: scale(1.25); }
+}
+@keyframes badge-pop {
+  0% { transform: scale(1); }
+  18% { transform: scale(1.28); }
+  36% { transform: scale(.96); }
+  54% { transform: scale(1.08); }
+  100% { transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pet-card { animation: none; }
+  .pet-bug, .antennae, .eyes, .sparkles { animation: none; }
+  .edge-shell.pulsing .edge-tab::after { animation: none; opacity: .7; }
+  .edge-shell.pulsing .edge-badge {
+    animation: none;
+    box-shadow: 0 0 0 3px rgba(255, 248, 234, .45), 0 2px 7px rgba(76, 62, 43, .2);
+  }
 }
 </style>

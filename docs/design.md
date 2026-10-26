@@ -99,6 +99,8 @@
 - 贴边窗在 `WindowRuntimeReady` 后再 Show（过早 Show 会被 Windows 忽略）；每次布局先 `SetSize`，再读回实际尺寸重新贴边，兼容 WebView2 对极窄窗口的最小尺寸限制
 - 贴边窗必须把 `DisableFramelessWindowDecorations` 设为 true，否则 Windows 11 会给无边框透明窗补一层白色圆角底板；展开窗尺寸精确等于卡片尺寸，避免卡片四周出现空白
 - 拖动使用系统原生搬窗：指针移动超过阈值后调用 `wails:drag`，由操作系统直接移动窗口，避免每个 `pointermove` 都走一次同步 IPC；Windows 监听 `WindowEndMove/WindowEndResize`、macOS 用 pointerup 加移动静默期兜底，松手后按窗口中心吸附最近屏幕边缘，并把 `edge.dock` / `edge.offset` 写入设置；重启后按保存的方向与沿边位置恢复
+- 贴边待处理提醒：收起标签内常驻数量徽标（todo + doing，10 条以上显示 `9+`），悬停卡片的头部换成待处理摘要与「看板 →」；调度器每 45–90 分钟随机检查一次，每天最多脉冲 3 次（按日期持久化），22:00–09:00 静默，捕获窗打开时顺延 7–10 分钟，待处理为 0 不脉冲。提醒只发 `edge:reminder` 事件让徽标短脉冲约 2 秒，不自动展开、不弹系统通知；关闭提醒后徽标仍随数据更新
+- 「看板 →」调用 `EdgeService.OpenBoard`：先收起贴边窗，再显示主窗并广播 `ui:open-pending`；看板切换到只看 todo/doing 的筛选，可一键移除。徽标与悬停文案都由同一份待处理状态驱动，数量变化来自保存 / 状态流转 / 删除后的 `edge:reminder` 事件
 - 贴边窗必须是非激活窗口：Windows 使用 `WS_EX_NOACTIVATE`（同时保留透明 / 置顶 / 工具窗标志），macOS 使用 `MacWindowClassPanel + NonActivating`。否则窗口未激活时第一次鼠标按下会被系统用于激活并吞掉，表现为“按下拖不动、也点不开”
 - macOS 贴边窗使用 `MacBackdropTransparent + Square 圆角 + DisableShadow + CanJoinAllSpaces | FullScreenAuxiliary | IgnoresCycle`，避免在 Space 切换与全屏应用下消失；托盘图标通过 `SetTemplateIcon` 适配菜单栏明暗。Wails 的透明 WebView 依赖 `private_mac_apis` 构建标签，Darwin Taskfile 已默认带上（未上架 App Store，不影响分发）
 - 默认热键由 `internal/store/defaults_{windows,darwin}.go` 提供；macOS 的 `Cmd` 由 Wails accelerator 映射为 Command，全局热键使用 Carbon，无需辅助功能权限

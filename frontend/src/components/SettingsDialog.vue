@@ -2,7 +2,7 @@
 import { reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
-  Activity, Copy, Database, FolderOpen, Keyboard, PanelRight, PlugZap, Rocket, X,
+  Activity, Bell, Copy, Database, FolderOpen, Keyboard, PanelRight, PlugZap, Rocket, X,
 } from 'lucide-vue-next'
 import { useSettings } from '../composables/useSettings'
 import { defaultHotkey, hotkeyExample } from '../lib/platform'
@@ -11,7 +11,7 @@ const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 const {
-  settings, load, save, testAI, setHotkey, setAutostart, setEdgeEnabled,
+  settings, load, save, testAI, setHotkey, setAutostart, setEdgeEnabled, setEdgeReminderEnabled,
   openDataDir, exportMarkdown, analyzeAll, copyText,
 } = useSettings()
 
@@ -24,6 +24,7 @@ const form = reactive({
 const aiEnabled = ref(true)
 const autoStart = ref(false)
 const edgeEnabled = ref(true)
+const reminderEnabled = ref(true)
 const testing = ref(false)
 const saving = ref(false)
 const analyzing = ref(false)
@@ -42,6 +43,7 @@ watch(
     aiEnabled.value = (settings.value['ai.enabled'] ?? 'true') === 'true'
     autoStart.value = settings.value.autostart === 'true'
     edgeEnabled.value = (settings.value['edge.enabled'] ?? 'true') === 'true'
+    reminderEnabled.value = (settings.value['edge.reminder.enabled'] ?? 'true') === 'true'
   },
 )
 
@@ -62,6 +64,7 @@ async function onSave() {
   }
   saving.value = true
   const edgeBefore = (settings.value['edge.enabled'] ?? 'true') === 'true'
+  const reminderBefore = (settings.value['edge.reminder.enabled'] ?? 'true') === 'true'
   try {
     await save(aiPayload())
     if (form.hotkey.trim() !== (settings.value.hotkey ?? '')) {
@@ -72,6 +75,9 @@ async function onSave() {
     }
     if (edgeEnabled.value !== edgeBefore) {
       await setEdgeEnabled(edgeEnabled.value)
+    }
+    if (reminderEnabled.value !== reminderBefore) {
+      await setEdgeReminderEnabled(reminderEnabled.value)
     }
     ElMessage.success('设置已保存')
     emit('close')
@@ -214,6 +220,15 @@ async function onOpenDataDir() {
           <span class="spacer" />
           <el-switch v-model="edgeEnabled" />
         </div>
+        <div class="sub-setting">
+          <div class="sub-copy">
+            <div class="sub-title"><Bell :size="12" /> 待处理提醒</div>
+            <div class="sub-note">
+              45–90 分钟随机脉冲，每天最多 3 次；22:00–09:00 静默，捕获窗打开时跳过
+            </div>
+          </div>
+          <el-switch v-model="reminderEnabled" :disabled="!edgeEnabled" />
+        </div>
       </section>
 
       <section class="group">
@@ -294,6 +309,16 @@ async function onOpenDataDir() {
 .group-title { font-size: 13px; font-weight: 700; }
 .group-sub { font-size: 10.5px; color: var(--rf-text-faint); margin-top: 2px; }
 .spacer { flex: 1; }
+.sub-setting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--rf-border);
+}
+.sub-copy { flex: 1; min-width: 0; }
+.sub-title { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--rf-text); }
+.sub-note { font-size: 10.5px; color: var(--rf-text-faint); margin-top: 2px; line-height: 1.5; }
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field.inline { flex-direction: row; align-items: center; gap: 10px; }
 .field label { font-size: 10.5px; font-weight: 700; letter-spacing: .07em; color: var(--rf-text-faint); text-transform: uppercase; }
