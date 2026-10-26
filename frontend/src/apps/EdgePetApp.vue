@@ -508,7 +508,7 @@ html, body, #app {
   flex-shrink: 0;
   border-radius: 9px 0 0 9px;
   background: linear-gradient(180deg, #c98633 0%, #a86313 58%, #8f520d 100%);
-  box-shadow: -6px 4px 16px rgba(76, 62, 43, 0.2), inset 1px 0 0 rgba(255, 253, 248, 0.35);
+  box-shadow: inset 1px 0 0 rgba(255, 253, 248, 0.35);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -517,7 +517,7 @@ html, body, #app {
 }
 .edge-shell.dock-left .edge-tab {
   border-radius: 0 9px 9px 0;
-  box-shadow: 6px 4px 16px rgba(76, 62, 43, 0.2), inset -1px 0 0 rgba(255, 253, 248, 0.35);
+  box-shadow: inset -1px 0 0 rgba(255, 253, 248, 0.35);
 }
 .edge-shell.dock-top .edge-tab,
 .edge-shell.dock-bottom .edge-tab {
@@ -526,11 +526,11 @@ html, body, #app {
 }
 .edge-shell.dock-top .edge-tab {
   border-radius: 0 0 9px 9px;
-  box-shadow: 0 6px 16px rgba(76, 62, 43, 0.2), inset 0 -1px 0 rgba(255, 253, 248, 0.35);
+  box-shadow: inset 0 -1px 0 rgba(255, 253, 248, 0.35);
 }
 .edge-shell.dock-bottom .edge-tab {
   border-radius: 9px 9px 0 0;
-  box-shadow: 0 -6px 16px rgba(76, 62, 43, 0.2), inset 0 1px 0 rgba(255, 253, 248, 0.35);
+  box-shadow: inset 0 1px 0 rgba(255, 253, 248, 0.35);
 }
 .edge-tab svg { width: 13px; height: 17px; filter: drop-shadow(0 1px 1px rgba(60, 37, 8, 0.25)); }
 .edge-shell:hover .edge-tab { filter: brightness(1.08); }
