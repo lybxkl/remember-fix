@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=记得修
+Comment=截屏记录 Bug，看板管理，AI 自动分类
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/remember-fix %u
+Terminal=false
+Type=Application
+Icon=remember-fix
+Categories=Utility;
+StartupWMClass=remember-fix
+
+ 

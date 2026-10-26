@@ -1,0 +1,15 @@
+{
+	"fixed": {
+		"file_version": "0.1.0"
+	},
+	"info": {
+		"0409": {
+			"ProductVersion": "0.1.0",
+			"CompanyName": "RememberFix",
+			"FileDescription": "截屏记录 Bug，看板管理，AI 自动分类",
+			"LegalCopyright": "© 2026 RememberFix",
+			"ProductName": "记得修",
+			"Comments": "Remember-Fix desktop app"
+		}
+	}
+}

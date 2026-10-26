@@ -1,0 +1,60 @@
+version: '3'
+
+tasks:
+  go:mod:tidy:
+    summary: Runs go mod tidy
+    run: once
+    cmds:
+      - go mod tidy
+
+  install:frontend:deps:
+    summary: Install frontend dependencies
+    run: once
+    dir: frontend
+    sources:
+      - package.json
+      - package-lock.json
+    generates:
+      - node_modules
+    cmds:
+      - npm install
+
+  build:frontend:
+    summary: Build the frontend (type-check + vite build + budget check)
+    run: once
+    dir: frontend
+    deps:
+      - task: install:frontend:deps
+    sources:
+      - "**/*"
+      - exclude: node_modules/**/*
+      - exclude: dist/**/*
+    generates:
+      - dist/**/*
+    cmds:
+      - npm run build
+
+  dev:frontend:
+    summary: Run the Vite dev server
+    deps:
+      - task: install:frontend:deps
+    dir: frontend
+    cmds:
+      - npm run dev -- --port {{.VITE_PORT}} --strictPort
+
+  generate:icons:
+    summary: Generate the Windows .ico from build/appicon.png
+    run: once
+    dir: build
+    sources:
+      - appicon.png
+    generates:
+      - windows/icon.ico
+    cmds:
+      - wails3 generate icons -input appicon.png -windowsfilename windows/icon.ico -macfilename darwin/icon.icns
+
+  update:build-assets:
+    summary: Update generated build assets from build/config.yml
+    dir: build
+    cmds:
+      - wails3 update build-assets -name "{{.APP_NAME}}" -binaryname "{{.APP_NAME}}" -config config.yml -dir .
