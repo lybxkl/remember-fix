@@ -2,7 +2,7 @@
 import { reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
-  Activity, Copy, Database, FolderOpen, Keyboard, PlugZap, Rocket, X,
+  Activity, Copy, Database, FolderOpen, Keyboard, PanelRight, PlugZap, Rocket, X,
 } from 'lucide-vue-next'
 import { useSettings } from '../composables/useSettings'
 
@@ -10,7 +10,7 @@ const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 const {
-  settings, load, save, testAI, setHotkey, setAutostart,
+  settings, load, save, testAI, setHotkey, setAutostart, setEdgeEnabled,
   openDataDir, exportMarkdown, analyzeAll, copyText,
 } = useSettings()
 
@@ -22,6 +22,7 @@ const form = reactive({
 })
 const aiEnabled = ref(true)
 const autoStart = ref(false)
+const edgeEnabled = ref(true)
 const testing = ref(false)
 const saving = ref(false)
 const analyzing = ref(false)
@@ -39,6 +40,7 @@ watch(
     form.hotkey = settings.value.hotkey ?? 'Ctrl+Alt+R'
     aiEnabled.value = (settings.value['ai.enabled'] ?? 'true') === 'true'
     autoStart.value = settings.value.autostart === 'true'
+    edgeEnabled.value = (settings.value['edge.enabled'] ?? 'true') === 'true'
   },
 )
 
@@ -58,6 +60,7 @@ async function onSave() {
     return
   }
   saving.value = true
+  const edgeBefore = (settings.value['edge.enabled'] ?? 'true') === 'true'
   try {
     await save(aiPayload())
     if (form.hotkey.trim() !== (settings.value.hotkey ?? '')) {
@@ -65,6 +68,9 @@ async function onSave() {
     }
     if (autoStart.value !== (settings.value.autostart === 'true')) {
       await setAutostart(autoStart.value)
+    }
+    if (edgeEnabled.value !== edgeBefore) {
+      await setEdgeEnabled(edgeEnabled.value)
     }
     ElMessage.success('设置已保存')
     emit('close')
@@ -194,6 +200,18 @@ async function onOpenDataDir() {
           <label>热键</label>
           <el-input v-model="form.hotkey" placeholder="Ctrl+Alt+R" style="width: 220px" />
           <span class="field-hint inline">例如 Ctrl+Alt+R / Ctrl+Shift+Space</span>
+        </div>
+      </section>
+
+      <section class="group">
+        <div class="group-head">
+          <span class="group-icon"><PanelRight :size="14" /></span>
+          <div>
+            <div class="group-title">桌面贴边</div>
+            <div class="group-sub">鼠标移到贴边小虫时展开；按住可拖到屏幕任意一边</div>
+          </div>
+          <span class="spacer" />
+          <el-switch v-model="edgeEnabled" />
         </div>
       </section>
 

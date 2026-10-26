@@ -77,11 +77,14 @@ CREATE TABLE IF NOT EXISTS settings (
 
 func (s *Store) seedSettings() {
 	defaults := map[string]string{
-		"ai.baseURL": DefaultAIBaseURL,
-		"ai.apiKey":  "",
-		"ai.model":   DefaultAIModel,
-		"ai.enabled": "true",
-		"hotkey":     DefaultHotkey,
+		"ai.baseURL":   DefaultAIBaseURL,
+		"ai.apiKey":    "",
+		"ai.model":     DefaultAIModel,
+		"ai.enabled":   "true",
+		"hotkey":       DefaultHotkey,
+		"edge.enabled": "true",
+		"edge.dock":    "right",
+		"edge.offset":  "-1",
 	}
 	for k, v := range defaults {
 		if _, err := s.db.Exec(`INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)`, k, v); err != nil {

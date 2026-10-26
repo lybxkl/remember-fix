@@ -29,12 +29,130 @@ type AppShell struct {
 	dataDir    string
 	mainWin    *application.WebviewWindow
 	captureWin *application.WebviewWindow
+	edgeWin    *application.WebviewWindow
 	trigger    func()
+
+	edgeDock       string
+	edgeOffset     int
+	edgeOffsetSet  bool
+	edgeDragging   bool
+	edgeDragStartX int
+	edgeDragStartY int
+	edgeWinStartX  int
+	edgeWinStartY  int
 
 	hotkeyMu sync.Mutex
 	hotkey   string
 
 	quitting atomic.Bool
+}
+
+const (
+	edgeCollapsedWidth  = 18
+	edgeCollapsedHeight = 64
+	edgeDockBarWidth    = 64
+	edgeDockBarHeight   = 18
+	edgeExpandedWidth   = 184
+	edgeExpandedHeight  = 232
+)
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func (s *AppShell) initEdgePosition(st *store.Store) {
+	switch st.GetSetting("edge.dock") {
+	case "left", "top", "bottom":
+		s.edgeDock = st.GetSetting("edge.dock")
+	default:
+		s.edgeDock = "right"
+	}
+	if v, err := strconv.Atoi(st.GetSetting("edge.offset")); err == nil && v >= 0 {
+		s.edgeOffset = v
+		s.edgeOffsetSet = true
+	}
+}
+
+func edgeWindowSize(dock string, expanded bool) (int, int) {
+	if expanded {
+		return edgeExpandedWidth, edgeExpandedHeight
+	}
+	if dock == "top" || dock == "bottom" {
+		return edgeDockBarWidth, edgeDockBarHeight
+	}
+	return edgeCollapsedWidth, edgeCollapsedHeight
+}
+
+func (s *AppShell) layoutEdge(expanded bool) {
+	if s.edgeWin == nil || s.app == nil {
+		return
+	}
+	screen := s.app.Screen.GetPrimary()
+	if screen == nil || screen.WorkArea.Width <= 0 || screen.WorkArea.Height <= 0 {
+		return
+	}
+	dock := s.edgeDock
+	switch dock {
+	case "left", "top", "bottom":
+	default:
+		dock = "right"
+	}
+	width, height := edgeWindowSize(dock, expanded)
+	s.edgeWin.SetSize(width, height)
+	// 部分 Windows/WebView2 组合会给极窄窗口一个最小尺寸，按实际尺寸重新贴边。
+	if actualWidth, actualHeight := s.edgeWin.Size(); actualWidth > 0 && actualHeight > 0 {
+		width, height = actualWidth, actualHeight
+	}
+	wa := screen.WorkArea
+	vertical := dock == "left" || dock == "right"
+	var center int
+	if vertical {
+		if s.edgeOffsetSet {
+			center = s.edgeOffset
+		} else {
+			center = wa.Y + wa.Height/2
+		}
+		center = clampInt(center, wa.Y+height/2, wa.Y+wa.Height-height/2)
+	} else {
+		if s.edgeOffsetSet {
+			center = s.edgeOffset
+		} else {
+			center = wa.X + wa.Width/2
+		}
+		center = clampInt(center, wa.X+width/2, wa.X+wa.Width-width/2)
+	}
+	var x, y int
+	switch dock {
+	case "left":
+		x, y = wa.X, center-height/2
+	case "top":
+		x, y = center-width/2, wa.Y
+	case "bottom":
+		x, y = center-width/2, wa.Y+wa.Height-height
+	default:
+		x, y = wa.X+wa.Width-width, center-height/2
+	}
+	s.edgeWin.SetPosition(x, y)
+}
+
+func (s *AppShell) SetEdgeEnabled(enabled bool) {
+	if s.edgeWin == nil {
+		return
+	}
+	if !enabled {
+		emit("edge:collapse", nil)
+		s.edgeWin.Hide()
+		return
+	}
+	s.layoutEdge(false)
+	s.edgeWin.Show()
+	emit("edge:collapse", nil)
 }
 
 func (s *AppShell) ShowMain() {
@@ -112,6 +230,8 @@ type CaptureService struct {
 
 // Trigger 抓取剪贴板快照，推送给捕获窗并显示窗口。
 func (s *CaptureService) Trigger() {
+	s.shell.layoutEdge(false)
+	emit("edge:collapse", nil)
 	snap := s.capturer.SnapshotNow()
 	emit("capture:ready", snap)
 	s.shell.ShowCapture()
@@ -133,6 +253,117 @@ func (s *CaptureService) Consume(id string) {
 	if id != "" {
 		s.capturer.Consume(id)
 	}
+}
+
+// ─── 贴边宠物服务 ───
+
+type EdgeService struct {
+	shell *AppShell
+	store *store.Store
+}
+
+func (s *EdgeService) ready() error {
+	if s.shell == nil || s.shell.edgeWin == nil {
+		return errors.New("贴边宠物尚未就绪")
+	}
+	return nil
+}
+
+func (s *EdgeService) SetExpanded(expanded bool) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	s.shell.layoutEdge(expanded)
+	return nil
+}
+
+// BeginDrag 记录拖动起点；随后 DragTo 按屏幕坐标移动窗口。
+func (s *EdgeService) BeginDrag(screenX, screenY int) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	// 拖动统一在展开卡片上进行，避免收起态拖拽后窗口尺寸与前端状态不一致。
+	s.shell.layoutEdge(true)
+	x, y := s.shell.edgeWin.Position()
+	s.shell.edgeDragStartX = screenX
+	s.shell.edgeDragStartY = screenY
+	s.shell.edgeWinStartX = x
+	s.shell.edgeWinStartY = y
+	s.shell.edgeDragging = true
+	return nil
+}
+
+func (s *EdgeService) DragTo(screenX, screenY int) error {
+	if s.shell == nil || s.shell.edgeWin == nil || !s.shell.edgeDragging || s.shell.app == nil {
+		return nil
+	}
+	screen := s.shell.app.Screen.GetPrimary()
+	if screen == nil {
+		return nil
+	}
+	wa := screen.WorkArea
+	width, height := s.shell.edgeWin.Size()
+	if width <= 0 || height <= 0 {
+		width, height = edgeExpandedWidth, edgeExpandedHeight
+	}
+	x := s.shell.edgeWinStartX + screenX - s.shell.edgeDragStartX
+	y := s.shell.edgeWinStartY + screenY - s.shell.edgeDragStartY
+	x = clampInt(x, wa.X, wa.X+wa.Width-width)
+	y = clampInt(y, wa.Y, wa.Y+wa.Height-height)
+	s.shell.edgeWin.SetPosition(x, y)
+	return nil
+}
+
+// EndDrag 松手后吸附到最近屏幕边缘，并记住沿边位置。
+func (s *EdgeService) EndDrag(screenX, screenY int) error {
+	if s.shell == nil || s.shell.edgeWin == nil || !s.shell.edgeDragging || s.shell.app == nil {
+		return nil
+	}
+	s.shell.edgeDragging = false
+	screen := s.shell.app.Screen.GetPrimary()
+	if screen == nil || screen.WorkArea.Width <= 0 || screen.WorkArea.Height <= 0 {
+		return nil
+	}
+	wa := screen.WorkArea
+	cx := clampInt(screenX, wa.X, wa.X+wa.Width)
+	cy := clampInt(screenY, wa.Y, wa.Y+wa.Height)
+	dock := "right"
+	nearest := wa.X + wa.Width - cx
+	if left := cx - wa.X; left < nearest {
+		dock, nearest = "left", left
+	}
+	if top := cy - wa.Y; top < nearest {
+		dock, nearest = "top", top
+	}
+	if bottom := wa.Y + wa.Height - cy; bottom < nearest {
+		dock = "bottom"
+	}
+	var offset int
+	if dock == "left" || dock == "right" {
+		offset = clampInt(cy, wa.Y+edgeCollapsedHeight/2, wa.Y+wa.Height-edgeCollapsedHeight/2)
+	} else {
+		offset = clampInt(cx, wa.X+edgeDockBarWidth/2, wa.X+wa.Width-edgeDockBarWidth/2)
+	}
+	s.shell.edgeDock = dock
+	s.shell.edgeOffset = offset
+	s.shell.edgeOffsetSet = true
+	if s.store != nil {
+		_ = s.store.SetSetting("edge.dock", dock)
+		_ = s.store.SetSetting("edge.offset", strconv.Itoa(offset))
+	}
+	s.shell.layoutEdge(true)
+	emit("edge:dock", dock)
+	return nil
+}
+
+// Trigger 先收起宠物，再打开捕获窗。
+func (s *EdgeService) Trigger() error {
+	if s.shell == nil || s.shell.trigger == nil {
+		return errors.New("捕获服务尚未就绪")
+	}
+	s.shell.layoutEdge(false)
+	go s.shell.trigger()
+	return nil
 }
 
 // ─── Bug 服务 ───
@@ -405,6 +636,16 @@ type ConfigService struct {
 func (s *ConfigService) GetAll() map[string]string {
 	cfg := s.store.GetAllSettings()
 	cfg["autostart"] = strconv.FormatBool(autostart.Enabled())
+	if _, ok := cfg["edge.enabled"]; !ok {
+		cfg["edge.enabled"] = "true"
+	}
+	if _, ok := cfg["edge.dock"]; !ok {
+		dock := s.shell.edgeDock
+		if dock == "" {
+			dock = "right"
+		}
+		cfg["edge.dock"] = dock
+	}
 	return cfg
 }
 
@@ -434,6 +675,15 @@ func (s *ConfigService) SetHotkey(accel string) error {
 
 func (s *ConfigService) SetAutostart(enabled bool) error {
 	return autostart.Set(enabled)
+}
+
+// SetEdgeEnabled 持久化贴边宠物开关并立即生效。
+func (s *ConfigService) SetEdgeEnabled(enabled bool) error {
+	if err := s.store.SetSetting("edge.enabled", strconv.FormatBool(enabled)); err != nil {
+		return err
+	}
+	s.shell.SetEdgeEnabled(enabled)
+	return nil
 }
 
 // TestAI 用当前保存的配置发一条测试消息，返回模型回复首行。

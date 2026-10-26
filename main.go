@@ -44,6 +44,7 @@ func main() {
 	}
 
 	shell := &AppShell{dataDir: dataDir}
+	shell.initEdgePosition(st)
 	capturer := capture.New(dataDir, clipboard.NewWindowsClipboard(), func(snap capture.Snapshot) {
 		emit("capture:update", snap)
 	})
@@ -51,6 +52,7 @@ func main() {
 	shell.trigger = capSvc.Trigger
 	bugSvc := &BugService{store: st, dataDir: dataDir}
 	cfgSvc := &ConfigService{store: st, shell: shell}
+	edgeSvc := &EdgeService{shell: shell, store: st}
 
 	var browserArgs []string
 	if os.Getenv("REMEMBER_FIX_DEBUG") == "1" {
@@ -67,6 +69,7 @@ func main() {
 			application.NewService(capSvc),
 			application.NewService(bugSvc),
 			application.NewService(cfgSvc),
+			application.NewService(edgeSvc),
 		},
 		Assets: application.AssetOptions{
 			Handler: assetHandler(assets, dataDir),
@@ -91,6 +94,13 @@ func main() {
 
 	setupWindows(app, shell)
 	setupTray(app, capSvc, shell)
+
+	// 等贴边窗口的 WebView 运行时就绪后再显示；过早 Show 会被 Windows 忽略。
+	shell.edgeWin.RegisterHook(events.Common.WindowRuntimeReady, func(*application.WindowEvent) {
+		if st.GetSetting("edge.enabled") != "false" {
+			shell.SetEdgeEnabled(true)
+		}
+	})
 
 	hotkey := st.GetSetting("hotkey")
 	if hotkey == "" {
@@ -185,6 +195,34 @@ func setupWindows(app *application.App, shell *AppShell) {
 			return
 		}
 		captureWin.Hide()
+		e.Cancel()
+	})
+
+	edgeWidth, edgeHeight := edgeWindowSize(shell.edgeDock, false)
+	edgeWin := app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Name:             "edge",
+		Title:            "记得修 · 贴边",
+		Width:            edgeWidth,
+		Height:           edgeHeight,
+		Frameless:        true,
+		AlwaysOnTop:      true,
+		Hidden:           true,
+		DisableResize:    true,
+		BackgroundType:   application.BackgroundTypeTransparent,
+		BackgroundColour: application.NewRGBA(0, 0, 0, 0),
+		URL:              "/edge.html",
+		Windows: application.WindowsWindow{
+			HiddenOnTaskbar:                   true,
+			Theme:                             application.Light,
+			DisableFramelessWindowDecorations: true,
+		},
+	})
+	shell.edgeWin = edgeWin
+	edgeWin.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		if shell.quitting.Load() {
+			return
+		}
+		edgeWin.Hide()
 		e.Cancel()
 	})
 }

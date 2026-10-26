@@ -26,12 +26,13 @@
 │                      Wails3 App (Go)                       │
 │                                                            │
 │  入口层    SystemTray.OnClick   GlobalShortcut.Register     │
-│            Window.Manager(主窗口 / 捕获窗)                  │
+│            Window.Manager(主窗口 / 捕获窗 / 贴边窗)          │
 │                                                            │
 │  服务层    CaptureService   抓剪贴板快照、历史 ring buffer   │
 │  (绑定到   BugService       CRUD、状态流转、筛选             │
 │   前端)    AIService        LLM 调用（Anthropic Messages）    │
 │            ConfigService    设置读写、API Key 管理           │
+│            EdgeService      贴边窗展开 / 收起 / 触发捕获     │
 │                                                            │
 │  基础层    clipboard/  Win32 剪贴板（图片 DIB→PNG、序列号）  │
 │            store/      SQLite (modernc.org/sqlite 纯 Go)    │
@@ -43,9 +44,10 @@
 └────────────────────────┬───────────────────────────────────┘
                          │ bindings (生成 TS) + events
 ┌────────────────────────▼───────────────────────────────────┐
-│              Vue3 前端（一个 Vite 工程，两个窗口入口）        │
+│              Vue3 前端（一个 Vite 工程，三个窗口入口）        │
 │   #/board   主窗口：看板视图 / 列表视图 / 详情抽屉 / 设置      │
 │   #/capture 捕获窗：预览+历史切换+TipTap+快速保存             │
+│   #/edge    贴边窗：四边可吸附的小虫，悬停展开、点击记录      │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -78,10 +80,14 @@
 |---|---|---|
 | 主窗口（看板） | 普通有框窗口 1200×760，`Hidden: true` 启动即藏 | 关闭 = 隐藏到托盘（不清进程） |
 | 捕获窗 | `Frameless + AlwaysOnTop + Width:460 Height:600`，无任务栏图标 | 每次触发 Show+Focus，Esc/保存后 Hide，单例复用 |
+| 贴边窗 | 透明 + `Frameless + AlwaysOnTop + HiddenOnTaskbar + DisableFramelessWindowDecorations`，收起 18×64 / 64×18、展开 184×232 | 默认常驻屏幕右缘；可拖到屏幕任意一边并吸附，位置持久化；设置可关；点击触发捕获后自动收起 |
 
-- 触发方式（三选一都做）：托盘左键单击 / 全局热键 `Ctrl+Alt+R`（可配置）/ 主窗口"记录"按钮
+- 触发方式（四选一都做）：托盘左键单击 / 全局热键 `Ctrl+Alt+R`（可配置）/ 主窗口"记录"按钮 / 屏幕边缘贴边宠物
 - Frameless 窗口自带 CSS 拖动区：`style="--wails-draggable: drag"`
-- 前端**单工程双入口**：两个窗口都加载同一 assets，按 `location.hash`（`#/capture`）渲染不同根组件，不引 vue-router（就用 hash 分发 + 主窗口内部简单视图切换，减少依赖）
+- 前端**单工程多入口**：`index.html` / `capture.html` / `edge.html` 共用同一 assets 与 Vite 构建，各自挂载独立根组件
+- 贴边窗在 `WindowRuntimeReady` 后再 Show（过早 Show 会被 Windows 忽略）；每次布局先 `SetSize`，再读回实际尺寸重新贴边，兼容 WebView2 对极窄窗口的最小尺寸限制
+- 贴边窗必须把 `DisableFramelessWindowDecorations` 设为 true，否则 Windows 11 会给无边框透明窗补一层白色圆角底板；展开窗尺寸精确等于卡片尺寸，避免卡片四周出现空白
+- 拖动时按屏幕坐标移动窗口，松手吸附最近屏幕边缘，并把 `edge.dock` / `edge.offset` 写入设置；重启后按保存的方向与沿边位置恢复
 
 ### 3.3 截图如何给前端显示
 

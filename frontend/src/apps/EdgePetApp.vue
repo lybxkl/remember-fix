@@ -1,0 +1,471 @@
+<script setup lang="ts">
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { call, onEvent } from '../lib/wails'
+
+type Dock = 'right' | 'left' | 'top' | 'bottom'
+
+const DOCKS: Dock[] = ['right', 'left', 'top', 'bottom']
+const expanded = ref(false)
+const busy = ref(false)
+const dragging = ref(false)
+const dock = ref<Dock>('right')
+const hotkey = ref('Ctrl+Alt+R')
+let leaveTimer: number | undefined
+let offCollapse: (() => void) | undefined
+let offDock: (() => void) | undefined
+let pointerId: number | null = null
+let startX = 0
+let startY = 0
+let lastX = 0
+let lastY = 0
+let dragMoved = false
+let dragReady = false
+let endAfterBegin: { x: number; y: number } | null = null
+
+function isDock(value: unknown): value is Dock {
+  return typeof value === 'string' && (DOCKS as string[]).includes(value)
+}
+
+async function loadConfig() {
+  try {
+    const cfg = await call<Record<string, string>>('main.ConfigService.GetAll')
+    if (cfg?.hotkey) hotkey.value = cfg.hotkey
+    if (isDock(cfg?.['edge.dock'])) dock.value = cfg['edge.dock']
+  } catch {
+    /* 保持默认显示 */
+  }
+}
+
+onMounted(() => {
+  loadConfig()
+  offCollapse = onEvent('edge:collapse', () => { expanded.value = false })
+  offDock = onEvent<unknown>('edge:dock', (value) => {
+    if (isDock(value)) dock.value = value
+  })
+})
+
+onBeforeUnmount(() => {
+  if (leaveTimer) window.clearTimeout(leaveTimer)
+  offCollapse?.()
+  offDock?.()
+})
+
+function cancelLeave() {
+  if (leaveTimer) {
+    window.clearTimeout(leaveTimer)
+    leaveTimer = undefined
+  }
+}
+
+async function onEnter() {
+  if (dragging.value) return
+  cancelLeave()
+  loadConfig()
+  if (expanded.value) return
+  expanded.value = true
+  try {
+    await call('main.EdgeService.SetExpanded', true)
+  } catch {
+    expanded.value = false
+  }
+}
+
+function scheduleCollapse() {
+  if (dragging.value) return
+  cancelLeave()
+  leaveTimer = window.setTimeout(collapse, 380)
+}
+
+async function collapse() {
+  cancelLeave()
+  if (!expanded.value) return
+  expanded.value = false
+  try {
+    await call('main.EdgeService.SetExpanded', false)
+  } catch {
+    /* 窗口可能正在关闭 */
+  }
+}
+
+async function report() {
+  if (busy.value) return
+  busy.value = true
+  expanded.value = false
+  try {
+    await call('main.EdgeService.Trigger')
+  } catch {
+    try {
+      await call('main.CaptureService.Trigger')
+    } catch {
+      /* 捕获窗尚未就绪 */
+    }
+  } finally {
+    window.setTimeout(() => { busy.value = false }, 500)
+  }
+}
+
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault()
+    report()
+  } else if (e.key === 'Escape') {
+    collapse()
+  }
+}
+
+function onPointerDown(e: PointerEvent) {
+  if (e.button !== 0 || pointerId !== null) return
+  pointerId = e.pointerId
+  startX = lastX = e.screenX
+  startY = lastY = e.screenY
+  dragMoved = false
+  dragReady = false
+  endAfterBegin = null
+  try {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+  } catch {
+    /* 合成事件可能没有活跃指针，仍由元素直接接收后续事件 */
+  }
+}
+
+// BeginDrag 会先把窗口展开，等它完成后再送移动/结束，避免极快拖动时后端乱序。
+async function startDrag() {
+  try {
+    await call('main.EdgeService.BeginDrag', startX, startY)
+    dragReady = true
+    if (endAfterBegin) {
+      const end = endAfterBegin
+      endAfterBegin = null
+      dragReady = false
+      await call('main.EdgeService.EndDrag', end.x, end.y)
+      return
+    }
+    await call('main.EdgeService.DragTo', lastX, lastY)
+  } catch {
+    dragReady = false
+  }
+}
+
+function endDragAt(x: number, y: number) {
+  if (!dragReady) {
+    endAfterBegin = { x, y }
+    return
+  }
+  dragReady = false
+  void call('main.EdgeService.EndDrag', x, y)
+}
+
+function onPointerMove(e: PointerEvent) {
+  if (pointerId === null || e.pointerId !== pointerId) return
+  lastX = e.screenX
+  lastY = e.screenY
+  if (!dragMoved) {
+    if (Math.hypot(e.screenX - startX, e.screenY - startY) < 4) return
+    dragMoved = true
+    dragging.value = true
+    expanded.value = true
+    cancelLeave()
+    void startDrag()
+    return
+  }
+  if (dragReady) void call('main.EdgeService.DragTo', e.screenX, e.screenY)
+}
+
+function finishPointer(e: PointerEvent) {
+  if (pointerId === null || e.pointerId !== pointerId) return
+  const wasDragging = dragMoved
+  pointerId = null
+  dragMoved = false
+  try {
+    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+  } catch {
+    /* ignore */
+  }
+  if (wasDragging) {
+    dragging.value = false
+    endDragAt(lastX, lastY)
+    return
+  }
+  report()
+}
+
+function onPointerCancel(e: PointerEvent) {
+  if (pointerId === null || e.pointerId !== pointerId) return
+  if (dragMoved) endDragAt(lastX, lastY)
+  pointerId = null
+  dragMoved = false
+  dragging.value = false
+}
+</script>
+
+<template>
+  <div
+    class="edge-shell"
+    :class="['dock-' + dock, { expanded, busy, dragging }]"
+    role="button"
+    tabindex="0"
+    title="点击记一条 Bug，按住可拖动位置"
+    aria-label="记一条 Bug，按住可拖动调整位置"
+    @mouseenter="onEnter"
+    @mouseleave="scheduleCollapse"
+    @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="finishPointer"
+    @pointercancel="onPointerCancel"
+    @keydown="onKey"
+  >
+    <div v-if="expanded" class="pet-card">
+      <div class="pet-bubble">
+        <span class="bubble-kicker">REMEMBER / FIX</span>
+        <strong>又发现 Bug 了？</strong>
+        <span class="bubble-sub">点一下，把刚遇到的情况记下来</span>
+      </div>
+
+      <div class="pet-stage" aria-hidden="true">
+        <svg class="pet-svg" viewBox="0 0 170 136" fill="none">
+          <defs>
+            <linearGradient id="edge-body" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#efb45d" />
+              <stop offset="1" stop-color="#cf8129" />
+            </linearGradient>
+            <linearGradient id="edge-head" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#ffdca5" />
+              <stop offset="1" stop-color="#f0b968" />
+            </linearGradient>
+            <radialGradient id="edge-glow" cx="50%" cy="50%" r="50%">
+              <stop offset="0" stop-color="#e8a34a" stop-opacity="0.2" />
+              <stop offset="1" stop-color="#e8a34a" stop-opacity="0" />
+            </radialGradient>
+          </defs>
+
+          <ellipse cx="85" cy="124" rx="48" ry="7" fill="url(#edge-glow)" />
+          <ellipse cx="85" cy="125" rx="30" ry="3.5" fill="#7f4a0c" opacity="0.12" />
+
+          <g class="pet-bug">
+            <g class="antennae" stroke="#8f520d" stroke-width="2" stroke-linecap="round">
+              <path d="M76 35c-7-9-12-13-19-16" />
+              <path d="M94 35c7-9 12-13 19-16" />
+            </g>
+            <circle cx="55" cy="18" r="3" fill="#a86313" />
+            <circle cx="115" cy="18" r="3" fill="#a86313" />
+
+            <g stroke="#8f520d" stroke-width="2.2" stroke-linecap="round" opacity="0.7">
+              <path d="M57 82 37 70M59 96 34 94M59 108 39 118" />
+              <path d="M113 82 133 70M111 96 136 94M111 108 131 118" />
+            </g>
+
+            <ellipse cx="85" cy="96" rx="34" ry="36" fill="url(#edge-body)" stroke="#8f520d" stroke-width="2.4" />
+            <path d="M85 69v53" stroke="#fff3dc" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 7" opacity="0.7" />
+
+            <circle cx="85" cy="52" r="26" fill="url(#edge-head)" stroke="#8f520d" stroke-width="2.4" />
+            <g class="eyes">
+              <circle cx="76" cy="50" r="5.2" fill="#fffdf8" />
+              <circle cx="94" cy="50" r="5.2" fill="#fffdf8" />
+              <circle cx="77" cy="51" r="2.5" fill="#3a2a18" />
+              <circle cx="95" cy="51" r="2.5" fill="#3a2a18" />
+              <circle cx="78" cy="50" r="0.8" fill="#fffdf8" />
+              <circle cx="96" cy="50" r="0.8" fill="#fffdf8" />
+            </g>
+            <ellipse cx="66" cy="59" rx="4.5" ry="2.4" fill="#d96b4c" opacity="0.35" />
+            <ellipse cx="104" cy="59" rx="4.5" ry="2.4" fill="#d96b4c" opacity="0.35" />
+            <path d="M80 61c2 3 8 3 10 0" stroke="#6f3d0a" stroke-width="1.8" stroke-linecap="round" />
+
+            <g transform="translate(123 88) rotate(-24) scale(2.1)" stroke="#a86313" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+            </g>
+          </g>
+
+          <g class="sparkles" stroke="#a86313" stroke-width="1.6" stroke-linecap="round" opacity="0.75">
+            <path d="M137 30v9M132.5 34.5h9" />
+            <path d="M34 44v6M31 47h6" />
+            <path d="M145 112v6M142 115h6" />
+          </g>
+        </svg>
+      </div>
+
+      <div class="pet-cta">
+        <span>{{ busy ? '正在打开…' : '点我记一条' }}</span>
+        <kbd>{{ hotkey }}</kbd>
+      </div>
+      <span class="pet-hint">自动带上剪贴板截图 / 文本</span>
+    </div>
+
+    <div v-else class="edge-tab" aria-hidden="true">
+      <svg viewBox="0 0 20 26" fill="none">
+        <g stroke="#fff8ea" stroke-width="1.35" stroke-linecap="round">
+          <path d="M7 6 4.5 3.5M13 6 15.5 3.5" />
+          <path d="M4.2 12.5H1.8M4.2 18H1.6M15.8 12.5h2.4M15.8 18h2.6" />
+          <circle cx="10" cy="8" r="3.2" />
+          <ellipse cx="10" cy="17" rx="4.4" ry="5.8" />
+        </g>
+      </svg>
+    </div>
+  </div>
+</template>
+
+<style>
+html, body, #app {
+  background: transparent !important;
+  overflow: hidden;
+}
+</style>
+
+<style scoped>
+.edge-shell {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  user-select: none;
+  font-family: var(--rf-sans);
+  cursor: pointer;
+  outline: none;
+}
+.edge-shell.dock-right { align-items: center; justify-content: flex-end; }
+.edge-shell.dock-left { align-items: center; justify-content: flex-start; }
+.edge-shell.dock-top { align-items: flex-start; justify-content: center; }
+.edge-shell.dock-bottom { align-items: flex-end; justify-content: center; }
+.edge-shell.dragging { cursor: grabbing; }
+.edge-shell:focus-visible .pet-card { outline: 1px solid var(--rf-accent); outline-offset: 2px; }
+
+.edge-tab {
+  position: relative;
+  width: 18px;
+  height: 64px;
+  flex-shrink: 0;
+  border-radius: 9px 0 0 9px;
+  background: linear-gradient(180deg, #c98633 0%, #a86313 58%, #8f520d 100%);
+  box-shadow: -6px 4px 16px rgba(76, 62, 43, 0.2), inset 1px 0 0 rgba(255, 253, 248, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  transition: filter .16s ease;
+}
+.edge-shell.dock-left .edge-tab {
+  border-radius: 0 9px 9px 0;
+  box-shadow: 6px 4px 16px rgba(76, 62, 43, 0.2), inset -1px 0 0 rgba(255, 253, 248, 0.35);
+}
+.edge-shell.dock-top .edge-tab,
+.edge-shell.dock-bottom .edge-tab {
+  width: 64px;
+  height: 18px;
+}
+.edge-shell.dock-top .edge-tab {
+  border-radius: 0 0 9px 9px;
+  box-shadow: 0 6px 16px rgba(76, 62, 43, 0.2), inset 0 -1px 0 rgba(255, 253, 248, 0.35);
+}
+.edge-shell.dock-bottom .edge-tab {
+  border-radius: 9px 9px 0 0;
+  box-shadow: 0 -6px 16px rgba(76, 62, 43, 0.2), inset 0 1px 0 rgba(255, 253, 248, 0.35);
+}
+.edge-tab svg { width: 13px; height: 17px; filter: drop-shadow(0 1px 1px rgba(60, 37, 8, 0.25)); }
+.edge-shell:hover .edge-tab { filter: brightness(1.08); }
+
+.pet-card {
+  box-sizing: border-box;
+  width: 184px;
+  height: 232px;
+  flex-shrink: 0;
+  padding: 12px 12px 10px;
+  border-radius: 18px;
+  border: 1px solid var(--rf-border);
+  background: linear-gradient(180deg, #fffdf9 0%, #faf5ea 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow: hidden;
+  position: relative;
+  animation: card-in .18s cubic-bezier(.2, .8, .2, 1);
+}
+.pet-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 20px;
+  right: 20px;
+  height: 2px;
+  border-radius: 0 0 2px 2px;
+  background: linear-gradient(90deg, transparent, rgba(168, 99, 19, 0.5), transparent);
+}
+.pet-bubble { text-align: center; line-height: 1.25; flex-shrink: 0; }
+.bubble-kicker {
+  display: block;
+  font-family: var(--rf-mono);
+  font-size: 7px;
+  letter-spacing: 0.14em;
+  color: var(--rf-accent);
+  opacity: 0.8;
+}
+.pet-bubble strong { display: block; margin-top: 3px; font-size: 14px; letter-spacing: -0.01em; color: var(--rf-text); }
+.bubble-sub { display: block; margin-top: 2px; font-size: 9.5px; color: var(--rf-text-faint); }
+.pet-stage {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 2px 0 0;
+}
+.pet-svg { width: 148px; height: 112px; overflow: visible; }
+.pet-bug { animation: pet-float 4.4s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+.antennae { animation: antenna-sway 3.6s ease-in-out infinite; transform-box: fill-box; transform-origin: center bottom; }
+.eyes { animation: pet-blink 5.2s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+.sparkles { animation: sparkle 3s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+
+.pet-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  border: 1px solid rgba(168, 99, 19, 0.48);
+  background: rgba(168, 99, 19, 0.06);
+  color: var(--rf-accent);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 700;
+  transition: background .15s ease, border-color .15s ease;
+}
+.pet-card:hover .pet-cta { background: rgba(168, 99, 19, 0.11); border-color: var(--rf-accent); }
+.pet-cta kbd { font-size: 8.5px; line-height: 14px; color: var(--rf-accent); border-color: rgba(168, 99, 19, 0.26); background: rgba(255, 253, 248, 0.7); }
+.pet-hint { flex-shrink: 0; margin-top: 3px; font-size: 8.5px; color: var(--rf-text-faint); }
+
+.edge-shell.dock-left .pet-card { animation-name: card-in-left; }
+.edge-shell.dock-top .pet-card { animation-name: card-in-top; }
+.edge-shell.dock-bottom .pet-card { animation-name: card-in-bottom; }
+
+@keyframes card-in {
+  from { opacity: 0; transform: translateX(14px) scale(.985); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+@keyframes card-in-left {
+  from { opacity: 0; transform: translateX(-14px) scale(.985); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+@keyframes card-in-top {
+  from { opacity: 0; transform: translateY(-14px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes card-in-bottom {
+  from { opacity: 0; transform: translateY(14px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes pet-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+@keyframes antenna-sway {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(2.5deg); }
+}
+@keyframes pet-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  95% { transform: scaleY(0.1); }
+}
+@keyframes sparkle {
+  0%, 100% { opacity: .35; }
+  50% { opacity: .9; }
+}
+</style>

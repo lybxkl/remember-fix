@@ -27,6 +27,11 @@ export function useSettings() {
     await load()
   }
 
+  async function setEdgeEnabled(enabled: boolean) {
+    await call('main.ConfigService.SetEdgeEnabled', enabled)
+    await load()
+  }
+
   async function openDataDir() {
     await call('main.ConfigService.OpenDataDir')
   }
@@ -44,7 +49,7 @@ export function useSettings() {
   }
 
   return {
-    settings, load, save, testAI, setHotkey, setAutostart,
+    settings, load, save, testAI, setHotkey, setAutostart, setEdgeEnabled,
     openDataDir, exportMarkdown, analyzeAll, copyText,
   }
 }
