@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { call, onEvent } from '../lib/wails'
-import type { Bug, CaptureItem, Snapshot } from '../lib/types'
+import type { Bug, CaptureItem, Kind, KindSource, Snapshot } from '../lib/types'
 
 const snapshot = ref<Snapshot>({ selectedId: '', items: [] })
 const selectedId = ref('')
@@ -49,17 +49,29 @@ export function useCapture() {
       : { type: 'text' as const, path: '', text: item.text }
   }
 
-  // 组装并保存 bug；成功后消费该剪贴板条目并隐藏捕获窗
-  async function save(opts: { title: string; description: string; descriptionText: string }) {
+  // 组装并保存事项；成功后消费该剪贴板条目并隐藏捕获窗
+  async function save(opts: {
+    title: string
+    description: string
+    descriptionText: string
+    kind: Kind
+    kindSource: KindSource
+    dueAt: number
+    dueAllDay: boolean
+  }) {
     const item = selected.value
     const bug: Bug = {
       id: '',
+      kind: opts.kind,
+      kindSource: opts.kindSource,
       title: opts.title,
       description: opts.description,
       descriptionText: opts.descriptionText,
       status: 'todo',
       category: 'uncategorized',
       severity: 'P2',
+      dueAt: opts.kind === 'todo' ? opts.dueAt : 0,
+      dueAllDay: opts.kind === 'todo' ? opts.dueAllDay : false,
       tags: [],
       attachments: item ? [itemToAttachment(item)] : [],
       sourceApp: item?.sourceApp || '',
@@ -70,10 +82,19 @@ export function useCapture() {
       resolvedAt: null,
     }
     const saved = await call<Bug>('main.BugService.Save', bug)
+    // 记录已经落库，后续清理失败不能误报“保存失败”或让窗口卡住。
     if (item) {
-      await call('main.CaptureService.Consume', item.id)
+      try {
+        await call('main.CaptureService.Consume', item.id)
+      } catch {
+        /* 下一次触发仍可看到该条目，但不影响本次保存 */
+      }
     }
-    await call('main.CaptureService.Cancel')
+    try {
+      await call('main.CaptureService.Cancel')
+    } catch {
+      /* 窗口可能已经被系统关闭 */
+    }
     return saved
   }
 

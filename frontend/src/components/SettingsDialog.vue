@@ -222,9 +222,9 @@ async function onOpenDataDir() {
         </div>
         <div class="sub-setting">
           <div class="sub-copy">
-            <div class="sub-title"><Bell :size="12" /> 待处理提醒</div>
+            <div class="sub-title"><Bell :size="12" /> 未完成提醒</div>
             <div class="sub-note">
-              45–90 分钟随机脉冲，每天最多 3 次；22:00–09:00 静默，捕获窗打开时跳过
+              45–90 分钟随机脉冲，每天最多 3 次；带具体时间的到期事项会优先提醒，同样计入次数。22:00–09:00 静默，捕获窗打开时跳过
             </div>
           </div>
           <el-switch v-model="reminderEnabled" :disabled="!edgeEnabled" />

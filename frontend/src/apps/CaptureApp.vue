@@ -3,9 +3,12 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ClipboardCopy, ClipboardPaste, Sparkles, Wrench, X } from 'lucide-vue-next'
 import RichEditor from '../components/RichEditor.vue'
+import KindSwitch from '../components/KindSwitch.vue'
+import DueField from '../components/DueField.vue'
 import { useCapture } from '../composables/useCapture'
 import { call } from '../lib/wails'
-import { formatTime } from '../lib/constants'
+import { duePreset, formatTime } from '../lib/constants'
+import type { IntentResult, Kind, KindSource } from '../lib/types'
 import { altName, defaultHotkey, modSymbol, screenshotKeys } from '../lib/platform'
 
 const { items, selected, selectedId, readyTick, select, sync, save, cancel } = useCapture()
@@ -18,33 +21,77 @@ const hotkey = ref(defaultHotkey)
 const titleInput = ref<HTMLInputElement>()
 const editorRef = ref<InstanceType<typeof RichEditor>>()
 
+const kind = ref<Kind>('bug')
+const kindSource = ref<KindSource>('heuristic')
+const intent = ref<IntentResult | null>(null)
+const manualKind = ref(false)
+const dueAt = ref(0)
+const dueAllDay = ref(true)
+let detectTimer: number | undefined
+let detectSeq = 0
+
 const isImage = computed(() => selected.value?.type === 'image')
 const shotURL = computed(() => (selected.value?.path ? '/shots/' + selected.value.path : ''))
 const selectedIndex = computed(() => items.value.findIndex((x) => x.id === selectedId.value))
 const hasSomething = computed(
   () => !!selected.value || !!title.value.trim() || !!descriptionText.value.trim(),
 )
+const isTodo = computed(() => kind.value === 'todo')
+const kindHint = computed(() => {
+  if (manualKind.value) return '手动选择'
+  if (!intent.value) return '正在判断…'
+  return intent.value.source === 'fallback' ? '沿用上次类型' : `自动判断 ${Math.round(intent.value.confidence * 100)}%`
+})
+const titlePlaceholder = computed(() =>
+  isTodo.value ? '要做什么、什么时候（留空由 AI 代写）' : '哪里、出了什么问题（留空由 AI 代写）',
+)
+const editorPlaceholder = computed(() =>
+  isTodo.value ? '要办什么、有没有时间限制、需要带什么…' : '做了什么、期望什么、实际怎样…',
+)
+const aiHint = computed(() =>
+  isTodo.value
+    ? '保存后 AI 会补全标题、优先级和到期时间（仅在你明确提及时）'
+    : '保存后 AI 会自动补全标题、分类与标签',
+)
 
 onMounted(async () => {
   await sync()
   await loadHotkey()
   focusPrimary()
+  runDetect()
   window.addEventListener('keydown', onKeydown)
 })
-onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+onBeforeUnmount(() => {
+  detectSeq++
+  if (detectTimer) window.clearTimeout(detectTimer)
+  window.removeEventListener('keydown', onKeydown)
+})
 
 watch(readyTick, async () => {
+  detectSeq++
+  if (detectTimer) {
+    window.clearTimeout(detectTimer)
+    detectTimer = undefined
+  }
   title.value = ''
   description.value = ''
   descriptionText.value = ''
+  dueAt.value = 0
+  dueAllDay.value = true
+  manualKind.value = false
+  kindSource.value = 'heuristic'
+  intent.value = null
   await loadHotkey()
   await nextTick()
   focusPrimary()
+  runDetect()
 })
 
 watch(description, (v) => {
   descriptionText.value = htmlToText(v)
 })
+
+watch([title, descriptionText, () => selected.value?.id], () => scheduleDetect())
 
 function focusPrimary() {
   setTimeout(() => titleInput.value?.focus(), 90)
@@ -54,9 +101,52 @@ async function loadHotkey() {
   try {
     const cfg = await call<Record<string, string>>('main.ConfigService.GetAll')
     if (cfg?.hotkey) hotkey.value = cfg.hotkey
+    // 首次输入前先沿用上次类型；后续会由本地判断覆盖。
+    if (!manualKind.value && !intent.value && cfg?.['capture.lastKind'] === 'todo') {
+      kind.value = 'todo'
+    }
   } catch {
     /* 保持默认显示 */
   }
+}
+
+function scheduleDetect() {
+  if (manualKind.value) return
+  if (detectTimer) window.clearTimeout(detectTimer)
+  detectTimer = window.setTimeout(runDetect, 220)
+}
+
+async function runDetect(): Promise<IntentResult | null> {
+  if (manualKind.value) return null
+  const seq = ++detectSeq
+  try {
+    const res = await call<IntentResult>('main.BugService.DetectIntent', {
+      title: title.value.trim(),
+      body: descriptionText.value.trim(),
+      sourceApp: selected.value?.sourceApp || '',
+      hasImage: selected.value?.type === 'image',
+    })
+    if (seq !== detectSeq || manualKind.value || !res) return null
+    intent.value = res
+    kind.value = res.kind
+    kindSource.value = 'heuristic'
+    return res
+  } catch {
+    /* 判断失败时保持当前类型 */
+    return null
+  }
+}
+
+function setKind(value: Kind) {
+  manualKind.value = true
+  kind.value = value
+  kindSource.value = 'user'
+}
+
+function setDuePreset(preset: 'today' | 'tomorrow' | 'weekend') {
+  if (!isTodo.value) return
+  dueAt.value = duePreset(preset)
+  dueAllDay.value = true
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -69,6 +159,18 @@ function onKeydown(e: KeyboardEvent) {
   } else if (e.key === 'ArrowRight' && e.altKey) {
     e.preventDefault()
     step(1)
+  } else if (e.altKey && e.key === '1') {
+    e.preventDefault()
+    setKind('bug')
+  } else if (e.altKey && e.key === '2') {
+    e.preventDefault()
+    setKind('todo')
+  } else if (e.altKey && (e.key === 't' || e.key === 'T')) {
+    e.preventDefault()
+    setDuePreset('today')
+  } else if (e.altKey && (e.key === 'n' || e.key === 'N')) {
+    e.preventDefault()
+    setDuePreset('tomorrow')
   }
 }
 
@@ -101,10 +203,16 @@ async function onSave() {
   }
   saving.value = true
   try {
+    // 保证最后一段输入也参与类型判断；手动选择的类型不会被覆盖。
+    if (!manualKind.value) await runDetect()
     await save({
       title: title.value.trim(),
       description: description.value,
       descriptionText: descriptionText.value,
+      kind: kind.value,
+      kindSource: manualKind.value ? 'user' : kindSource.value,
+      dueAt: dueAt.value,
+      dueAllDay: dueAllDay.value,
     })
     title.value = ''
     description.value = ''
@@ -129,7 +237,7 @@ function htmlToText(html: string): string {
       <div class="cap-brand">
         <span class="brand-mark"><Wrench :size="15" :stroke-width="2.2" /></span>
         <div class="cap-brand-text">
-          <span class="cap-eyebrow">REMEMBER / FIX</span>
+          <span class="cap-eyebrow">REMEMBER / EVERYTHING</span>
           <span class="cap-title">记一条</span>
         </div>
       </div>
@@ -202,24 +310,38 @@ function htmlToText(html: string): string {
       </section>
 
       <section class="cap-form">
+        <div class="cap-kind-row">
+          <span class="field-label">类型</span>
+          <KindSwitch
+            :model-value="kind"
+            compact
+            :hint="kindHint"
+            :hint-title="intent?.reason"
+            @update:model-value="setKind"
+          />
+        </div>
+        <div v-if="isTodo" class="cap-due-row">
+          <DueField v-model="dueAt" v-model:all-day="dueAllDay" compact />
+        </div>
+
         <label class="field-label" for="cap-title">一句话</label>
         <input
           id="cap-title"
           ref="titleInput"
           v-model="title"
           class="cap-title-input"
-          placeholder="哪里、出了什么问题（留空由 AI 代写）"
+          :placeholder="titlePlaceholder"
         />
 
         <div class="field-row">
           <label class="field-label">细节</label>
-          <span class="ai-hint"><Sparkles :size="11" /> 保存后 AI 会自动补全标题、分类与标签</span>
+          <span class="ai-hint"><Sparkles :size="11" /> {{ aiHint }}</span>
         </div>
         <div class="cap-editor">
           <RichEditor
             ref="editorRef"
             v-model="description"
-            placeholder="做了什么、期望什么、实际怎样…"
+            :placeholder="editorPlaceholder"
             :min-height="92"
             @insert-shot="insertShot"
           />
@@ -228,7 +350,7 @@ function htmlToText(html: string): string {
     </div>
 
     <footer class="cap-foot">
-      <span class="cap-shortcuts"><kbd>Esc</kbd> 关闭 <span class="dot-sep">·</span> <kbd>{{ modSymbol }}</kbd><kbd>↵</kbd> 保存</span>
+      <span class="cap-shortcuts"><kbd>Esc</kbd> 关闭 <span class="dot-sep">·</span> <kbd>{{ modSymbol }}</kbd><kbd>↵</kbd> 保存 <span class="dot-sep">·</span> <kbd>Alt</kbd>+<kbd>1/2</kbd> 切类型</span>
       <span class="spacer" />
       <button class="btn-ghost" @click="cancel">放弃</button>
       <button class="btn-commit" :disabled="saving || !hasSomething" @click="onSave">
@@ -439,6 +561,15 @@ function htmlToText(html: string): string {
 .hist-hint { font-size: 10px; color: var(--rf-text-faint); white-space: nowrap; margin-left: 2px; }
 
 .cap-form { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 7px; }
+.cap-kind-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  flex-shrink: 0;
+}
+.cap-kind-row .field-label { flex-shrink: 0; }
+.cap-due-row { flex-shrink: 0; margin: -1px 0 1px; }
 .field-row { display: flex; align-items: center; gap: 8px; }
 .field-label {
   font-size: 10.5px;

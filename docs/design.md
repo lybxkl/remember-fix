@@ -40,8 +40,9 @@
 │            ai/         HTTP 客户端、prompt、JSON 解析        │
 │            fsx/        数据目录、截图文件落盘                 │
 │                                                            │
-│  事件      app.Event.Emit  capture:ready / bug:saved /      │
-│            ai:updated / clipboard:changed                  │
+│  事件      app.Event.Emit  capture:ready / capture:update /    │
+│            bug:changed / bug:kind-changed / bug:deleted /     │
+│            edge:reminder / ui:open-pending / ui:open-settings  │
 └────────────────────────┬───────────────────────────────────┘
                          │ bindings (生成 TS) + events
 ┌────────────────────────▼───────────────────────────────────┐
@@ -90,16 +91,16 @@
 | 窗口 | 参数 | 生命周期 |
 |---|---|---|
 | 主窗口（看板） | 普通有框窗口 1200×720（最小 980×600） | 关闭 = 隐藏到托盘（不清进程）；Windows 使用原生亮色标题栏，macOS 使用 Aqua 外观 |
-| 捕获窗 | `Frameless + AlwaysOnTop + Width:500 Height:680`，无任务栏图标 | 每次触发 Show+Focus，Esc/保存后 Hide，单例复用；macOS 加入所有 Space 并覆盖全屏应用 |
-| 贴边窗 | 透明 + `Frameless + AlwaysOnTop + HiddenOnTaskbar + DisableResize`，收起 24×64 / 64×24、展开 184×232 | 默认常驻屏幕右缘；可拖到屏幕任意一边并吸附，位置持久化；设置可关；点击触发捕获后自动收起 |
+| 捕获窗 | `Frameless + AlwaysOnTop + Width:500 Height:710`（最小 460×620），无任务栏图标 | 每次触发 Show+Focus，Esc/保存后 Hide，单例复用；macOS 加入所有 Space 并覆盖全屏应用 |
+| 贴边窗 | 透明 + `Frameless + AlwaysOnTop + HiddenOnTaskbar + DisableResize`，收起 24×64 / 64×24、展开 184×232 | 默认常驻屏幕右缘；可拖到所在显示器的任意一边并吸附，记录显示器与沿边位置，设置可关；点击触发捕获后自动收起 |
 
 - 触发方式（四选一都做）：托盘/菜单栏左键单击 / 全局热键（Windows 默认 `Ctrl+Alt+R`，macOS 默认 `Cmd+Alt+R`，可配置）/ 主窗口"记录"按钮 / 屏幕边缘贴边宠物
 - Frameless 窗口自带 CSS 拖动区：`style="--wails-draggable: drag"`
 - 前端**单工程多入口**：`index.html` / `capture.html` / `edge.html` 共用同一 assets 与 Vite 构建，各自挂载独立根组件
 - 贴边窗在 `WindowRuntimeReady` 后再 Show（过早 Show 会被 Windows 忽略）；每次布局先 `SetSize`，再读回实际尺寸重新贴边，兼容 WebView2 对极窄窗口的最小尺寸限制
 - 贴边窗必须把 `DisableFramelessWindowDecorations` 设为 true，否则 Windows 11 会给无边框透明窗补一层白色圆角底板；展开窗尺寸精确等于卡片尺寸，避免卡片四周出现空白
-- 拖动使用系统原生搬窗：指针移动超过阈值后调用 `wails:drag`，由操作系统直接移动窗口，避免每个 `pointermove` 都走一次同步 IPC；Windows 监听 `WindowEndMove/WindowEndResize`、macOS 用 pointerup 加移动静默期兜底，松手后按窗口中心吸附最近屏幕边缘，并把 `edge.dock` / `edge.offset` 写入设置；重启后按保存的方向与沿边位置恢复
-- 贴边待处理提醒：收起标签内常驻数量徽标（todo + doing，10 条以上显示 `9+`），悬停卡片的头部换成待处理摘要与「看板 →」；调度器每 45–90 分钟随机检查一次，每天最多脉冲 3 次（按日期持久化），22:00–09:00 静默，捕获窗打开时顺延 7–10 分钟，待处理为 0 不脉冲。提醒只发 `edge:reminder` 事件让徽标短脉冲约 2 秒，不自动展开、不弹系统通知；关闭提醒后徽标仍随数据更新
+- 拖动使用系统原生搬窗：指针移动超过阈值后调用 `wails:drag`，由操作系统直接移动窗口，避免每个 `pointermove` 都走一次同步 IPC；Windows 监听 `WindowEndMove/WindowEndResize`、macOS 用 pointerup 加移动静默期兜底，松手后按窗口中心吸附当前显示器最近屏幕边缘，并把 `edge.dock` / `edge.offset` / `edge.screenID` 写入设置；重启后恢复到原显示器的沿边位置
+- 贴边待处理提醒：收起标签内常驻数量徽标（todo + doing，10 条以上显示 `9+`），悬停卡片的头部换成待处理摘要与「看板 →」；调度器每 45–90 分钟随机检查一次，每天最多脉冲 3 次（按日期持久化），22:00–09:00 静默，捕获窗打开时顺延 7–10 分钟，待处理为 0 不脉冲。提醒只发 `edge:reminder` 事件让徽标短脉冲约 2 秒，不自动展开、不弹系统通知；关闭提醒后徽标仍随数据更新。新保存/修改的到期时间若早于当前定时器，会立即把下一次检查提前；贴边窗另按最近到期时刻与午夜刷新文案，避免“今天”跨点后仍显示为今天
 - 「看板 →」调用 `EdgeService.OpenBoard`：先收起贴边窗，再显示主窗并广播 `ui:open-pending`；看板切换到只看 todo/doing 的筛选，可一键移除。徽标与悬停文案都由同一份待处理状态驱动，数量变化来自保存 / 状态流转 / 删除后的 `edge:reminder` 事件
 - 贴边窗必须是非激活窗口：Windows 使用 `WS_EX_NOACTIVATE`（同时保留透明 / 置顶 / 工具窗标志），macOS 使用 `MacWindowClassPanel + NonActivating`。否则窗口未激活时第一次鼠标按下会被系统用于激活并吞掉，表现为“按下拖不动、也点不开”
 - macOS 贴边窗使用 `MacBackdropTransparent + Square 圆角 + DisableShadow + CanJoinAllSpaces | FullScreenAuxiliary | IgnoresCycle`，避免在 Space 切换与全屏应用下消失；托盘图标通过 `SetTemplateIcon` 适配菜单栏明暗。Wails 的透明 WebView 依赖 `private_mac_apis` 构建标签，Darwin Taskfile 已默认带上（未上架 App Store，不影响分发）
@@ -135,6 +136,8 @@ CREATE INDEX idx_bugs_category ON bugs(category);
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
 ```
 
+> 通用事项版本新增的 `kind` / `kind_source` / `due_at` / `due_all_day` 字段及迁移策略见第 9 节。
+
 ### 3.5 大模型接入 —— Anthropic Messages 协议
 
 设置里配 `ai.baseURL + ai.apiKey + ai.model`（`ai.enabled` 总开关）。客户端按 Anthropic Messages 协议请求 `POST /v1/messages`，携带 `x-api-key` 与 `anthropic-version: 2023-06-01`；默认指向阿里云百炼 MaaS 的 Anthropic 兼容端点 `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic`，默认模型 `qwen3.8-max`（原生支持图片输入，同一模型同时处理截图与文本）。
@@ -143,14 +146,14 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
 
 | 能力 | 触发 | 输入 | 输出 |
 |---|---|---|---|
-| 智能归类 | 保存新 bug 后异步执行 | 截图 + 描述 + 剪贴板文本附件 | 严格 JSON：`{title, category, severity, tags[], summary, steps[]}` |
+| 智能归类 | 保存新记录后异步执行 | 截图 + 描述 + 剪贴板文本附件 | 严格 JSON：`{kind, kindConfidence, title, category, severity, tags[], summary, steps[], due}` |
 | 批量补全 | 设置页按钮"分析未分析记录" | 同上 | 批量任务，逐条更新，状态事件推送 |
-| Markdown 导出 | 设置页/按状态导出 | 本地记录 + 截图 | `exports/remember-fix-<时间>/bugs.md` + `assets/` |
+| Markdown 导出 | 设置页/按类型与状态导出 | 本地记录 + 截图 | `exports/remember-fix-<时间>/items.md` + `assets/` |
 | 转 AI 编程指令 | bug 详情按钮"生成修复 prompt" | 记录 + AI 结论 | 可一键复制给 Claude Code/Cursor |
 
 **工程要点：**
 - 输出约束为裸 JSON，兼容 ```json 围栏与首尾花括号提取，不依赖模型 JSON mode
-- 单次分析 `max_tokens=4096`，HTTP 超时 120s、分析总超时 150s；温度沿用服务端默认
+- 单次分析 `max_tokens=4096`，HTTP 超时 120s、分析总超时 150s，temperature 固定为 0.2
 - **AI 失败绝不阻塞保存**：`ai_status=failed`，保留上一次成功结果，可手动重试或批量补全
 - AI 只回填空字段：用户已填写的标题/分类/标签/严重度不会被覆盖
 - 并发分析用 `sync.Map` 去重，避免重复请求
@@ -160,25 +163,26 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
 
 ```
 frontend/src/
-├── main.ts               # hash 分发：#/capture → CaptureApp，其余 → BoardApp
+├── entries/              # board.ts / capture.ts / edge.ts 三个 Vite 入口
 ├── apps/
-│   ├── BoardApp.vue      # 看板：5 列、卡片 HTML5 拖拽、搜索/筛选
-│   └── CaptureApp.vue    # 捕获窗：预览+历史+编辑+保存
+│   ├── BoardApp.vue      # 看板：多视图、卡片 HTML5 拖拽、搜索/筛选
+│   ├── CaptureApp.vue    # 捕获窗：预览+历史+编辑+保存
+│   └── EdgePetApp.vue    # 贴边窗：收起标签 / 悬停卡片 / 原生拖窗
 ├── components/
 │   ├── BugCard.vue  BugDrawer.vue(详情)  StatusColumn.vue
-│   ├── CapturePreview.vue  HistorySwitcher.vue
+│   ├── KindSwitch.vue  DueField.vue
 │   ├── RichEditor.vue   # TipTap（starter-kit + image + table + sub/sup + text-align）
 │   └── SettingsDialog.vue
 ├── composables/
-│   ├── bugs.ts           # 调 bindings，缓存 + 事件驱动刷新
-│   ├── capture.ts        # 快照加载、剪贴板历史切换
-│   └── events.ts         # 封装 @wailsio/runtime Events
-└── bindings/             # wails3 generate bindings 产物
+│   ├── useBugs.ts        # 调 Go 服务，缓存 + 事件驱动刷新
+│   ├── useCapture.ts     # 快照加载、剪贴板历史切换
+│   └── useSettings.ts    # 设置读写
+└── lib/                  # 类型、常量、Wails 事件、Markdown、平台差异
 ```
 
 - **看板拖拽：原生 HTML5 DnD 自实现**（dragstart 记 bugId → dragover 高亮列 → drop 调 `BugService.UpdateStatus`），不引 vuedraggable
 - 状态管理用 composables（reactive 单例 + Events 订阅刷新），不引 pinia——两张窗口数据独立加载，靠 Go 事件保持一致
-- Element Plus 按需自动导入；空状态使用内联 SVG 动画，不引入 three.js，守住 bundle 预算
+- Element Plus 采用全局注册 + 完整样式（未接按需导入插件）；空状态使用内联 SVG 动画，不引入 three.js，用 bundle 预算脚本卡住总体积
 
 ## 4. 关键流程时序
 
@@ -188,12 +192,12 @@ frontend/src/
  → Go: CaptureService.Snapshot()
     读序列号 → 读 PNG/DIBV5/DIB（Windows）或 PNG/TIFF（macOS）或文本
     → 落盘 %ConfigDir%/remember-fix/shots/
-    → app.Event.Emit("capture:ready", {snapshotId, attachments})
+    → app.Event.Emit("capture:ready", {selectedId, items})
  → 捕获窗 Show + Focus（前端已在后台驻留，首开 <100ms）
- → 用户：切换历史(可选) / TipTap 写描述 / 微调 AI 预填字段
- → Ctrl/⌘+Enter → BugService.Save() → 入库 → 发 "bug:saved"
- → 捕获窗 Hide；若主窗口开着 → 看板收到新卡片（动画滑入）
- → AIService.Analyze(bugId) 异步 → 完成后 Emit "ai:updated" → 卡片徽标刷新
+ → 用户：切换历史(可选) / TipTap 写描述 / 微调类型与到期
+ → Ctrl/⌘+Enter → BugService.Save() → 入库 → 发 "bug:changed"
+ → 捕获窗 Hide；主窗口收到新卡片
+ → BugService.analyzeAsync 异步 → 完成后 Emit "bug:changed" / "bug:kind-changed"
 ```
 
 **剪贴板历史监听（常驻，开销极低）**
@@ -213,6 +217,7 @@ remember-fix/
 │   ├── clipboard/           # windows.go(Win32) / clipboard_darwin.go+.m(NSPasteboard) + 单测
 │   ├── store/               # store.go(打开/迁移) + bugs.go + defaults_*.go + 单测
 │   ├── ai/                  # anthropic.go(Messages 协议) + analyze.go(prompt/解析)
+│   ├── intent/              # 本地 Bug / 待办意图识别
 │   ├── capture/             # 剪贴板快照、序列号去重、晚到截图检查
 │   ├── autostart/           # Windows HKCU Run / macOS LaunchAgent
 │   ├── exporter/            # 按状态导出 Markdown + 截图
@@ -248,3 +253,20 @@ remember-fix/
 ## 8. 二期候选
 
 多项目空间（bugs 加 project_id）、相似 bug 检测（embedding）、全局剪贴板历史面板、截图标注（画框/箭头）、浏览器插件抓 URL、DPAPI / Keychain 加密 API Key、托盘气泡提醒"你有 12 个 bug 超过一周没修"、macOS 公证（notarization）。
+
+## 9. 通用事项与自动类型识别（已落地）
+
+产品从"只记 Bug"扩展为"Bug + 待办"，核心约束是**不要求用户先选类型**：
+
+| 决策点 | 实现 |
+|---|---|
+| 数据模型 | `bugs` 表新增 `kind`（bug/todo）、`kind_source`（heuristic/ai/user）、`due_at`、`due_all_day`；启动时通过 `PRAGMA table_info` + `ALTER TABLE` 安全升级旧库，历史记录归为 Bug 且 `kind_source=user` |
+| 本地初判 | `internal/intent` 综合 Bug 缺陷词、待办动作/时间词、清单结构、截图与来源应用打分；分数接近或线索不足时回退到 `capture.lastKind`，不硬猜 |
+| 捕获交互 | 类型胶囊实时显示"自动判断 / 沿用上次 / 手动选择"；`Alt+1/2` 切换；手动选择只作用于本次记录并标记 `user` |
+| AI 统一分析 | 同一次请求先输出 `kind + kindConfidence`，再按类型补全；待办不产出复现步骤，只有用户明确提及时才解析 `due`（过去时间丢弃） |
+| 自动纠型 | 仅当 `kind_source != user` 且 AI 置信度 ≥ 0.8 时切换；广播 `bug:kind-changed`，看板用可撤销 toast 呈现；撤销时回写原类型、原状态（如 verified）并清除 AI 自动补的到期时间，然后锁定 `user` |
+| 状态映射 | 待办没有"已验证"：切换到待办时 verified → fixed；待办视图只显示待办 / 进行中 / 已完成 / 已搁置 |
+| 看板 | 全部 / Bug / 待办三视图；全部视图 4 列并把 fixed+verified 合并为"已完成"；列内带具体到期时间的未完成事项优先排序 |
+| 到期与提醒 | 卡片显示逾期 / 今天 / 明天；看板支持今天 / 逾期筛选；提醒统计逾期与今日数量，徽标逾期变红，悬停优先展示逾期或今日；带具体时间的到期事项会提前触发 tick，新增或修改的到期时间会即时把定时器提前，但仍受每日 3 次与静默时段约束；贴边徽标在到期时刻与午夜自动刷新 |
+| 并发与恢复 | AI 回写使用“只更新已存在记录”，记录被删除后不会被旧分析结果复活；应用启动时把上一进程遗留的 `ai_status=pending` 标记为失败，避免重试按钮永久禁用 |
+| 导出 | 按类型 + 状态分组输出 `items.md`，待办附到期时间、不再输出复现步骤 |

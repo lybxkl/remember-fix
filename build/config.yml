@@ -4,7 +4,7 @@ info:
   companyName: "RememberFix"
   productName: "记得修"
   productIdentifier: "com.rememberfix.desktop"
-  description: "截屏记录 Bug，看板管理，AI 自动分类"
+  description: "截屏记录 Bug 与待办，看板管理，AI 自动分类"
   copyright: "© 2026 RememberFix"
   comments: "Remember-Fix desktop app"
   version: "0.1.0"

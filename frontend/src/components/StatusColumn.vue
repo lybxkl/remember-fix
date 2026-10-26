@@ -9,11 +9,14 @@ const props = defineProps<{
   code: string
   color: string
   bugs: Bug[]
+  showKind?: boolean
+  now?: number
 }>()
 
 const emit = defineEmits<{
   (e: 'open', id: string): void
   (e: 'drop', bugId: string, status: string): void
+  (e: 'complete', bug: Bug): void
 }>()
 
 const dragDepth = ref(0)
@@ -64,7 +67,15 @@ function onDrop(e: DragEvent) {
       <span class="col-count">{{ count }}</span>
     </header>
     <div class="col-body">
-      <BugCard v-for="b in bugs" :key="b.id" :bug="b" @open="emit('open', $event)" />
+      <BugCard
+        v-for="b in bugs"
+        :key="b.id"
+        :bug="b"
+        :show-kind="showKind"
+        :now="now"
+        @open="emit('open', $event)"
+        @complete="emit('complete', $event)"
+      />
       <div v-if="!bugs.length" class="col-empty">
         <span class="empty-line" />
         <span>拖到这里</span>

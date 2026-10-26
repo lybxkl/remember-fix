@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 import { call, onEvent } from '../lib/wails'
-import type { Bug } from '../lib/types'
+import type { Bug, KindChange } from '../lib/types'
 
 const bugs = ref<Bug[]>([])
 const loading = ref(false)
@@ -60,9 +60,26 @@ export function useBugs() {
     await call('main.BugService.Reanalyze', id)
   }
 
+  async function setKind(id: string, kind: 'bug' | 'todo', lock = true) {
+    await call('main.BugService.SetKind', id, kind, lock)
+  }
+
+  async function undoKindChange(change: KindChange) {
+    await call('main.BugService.UndoKindChange', {
+      id: change.id,
+      from: change.from,
+      to: change.to,
+      fromStatus: change.fromStatus,
+      fromDueAt: change.fromDueAt,
+      toDueAt: change.toDueAt,
+    })
+  }
+
   async function fixPrompt(id: string): Promise<string> {
     return call<string>('main.BugService.GenerateFixPrompt', id)
   }
 
-  return { bugs, loading, error, load, save, updateStatus, remove, reanalyze, fixPrompt }
+  return {
+    bugs, loading, error, load, save, updateStatus, remove, reanalyze, setKind, undoKindChange, fixPrompt,
+  }
 }

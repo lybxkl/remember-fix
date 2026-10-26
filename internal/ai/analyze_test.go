@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lybxkl/remember-fix/internal/models"
 )
@@ -68,5 +69,58 @@ func TestAnalyzeBugSendsClipboardText(t *testing.T) {
 	}
 	if len(sugg.Steps) != 2 || len(sugg.Tags) != 2 {
 		t.Fatalf("unexpected lists: %+v", sugg)
+	}
+}
+
+func TestAnalyzeTodoWithDue(t *testing.T) {
+	due := time.Now().AddDate(0, 0, 1).Format("2006-01-02") + "T09:30"
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]string{{
+				"type": "text",
+				"text": `{"kind":"todo","kindConfidence":0.93,"title":"去体检","category":"ui","severity":"P2","tags":["体检"],"summary":"明天上午去体检。","steps":["不该出现的步骤"],"due":"` + due + `"}`,
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	bug := &models.Bug{DescriptionText: "明天上午九点半去体检"}
+	client := NewClient(srv.URL, "test-key", "test-model")
+	sugg, err := AnalyzeBug(context.Background(), client, bug, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sugg.Kind != models.KindTodo || sugg.KindConfidence != 0.93 {
+		t.Fatalf("unexpected kind: %+v", sugg)
+	}
+	if sugg.DueAt == 0 || sugg.DueAllDay {
+		t.Fatalf("timed due not parsed: %+v", sugg)
+	}
+	if len(sugg.Steps) != 0 {
+		t.Fatalf("todo should not keep repro steps: %+v", sugg.Steps)
+	}
+	if !strings.Contains(gotBody, "当前时间") {
+		t.Fatalf("prompt should include current date for relative dates: %s", gotBody)
+	}
+}
+
+func TestParseDue(t *testing.T) {
+	now := time.Date(2026, 10, 26, 15, 0, 0, 0, time.Local)
+	tomorrow := "2026-10-27"
+	if got, allDay := parseDue(tomorrow, now); got == 0 || !allDay {
+		t.Fatalf("date-only due should be all-day: %d %v", got, allDay)
+	}
+	if got, allDay := parseDue("2026-10-27T09:30", now); got == 0 || allDay {
+		t.Fatalf("timed due should not be all-day: %d %v", got, allDay)
+	}
+	if got, _ := parseDue("2026-10-25", now); got != 0 {
+		t.Fatalf("past due should be ignored, got %d", got)
+	}
+	if got, _ := parseDue("明天上午", now); got != 0 {
+		t.Fatalf("unparseable due should be ignored, got %d", got)
 	}
 }

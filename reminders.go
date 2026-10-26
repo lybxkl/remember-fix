@@ -26,8 +26,11 @@ const (
 
 // ReminderState 是贴边窗徽标与悬停文案共用的唯一数据源。
 type ReminderState struct {
-	Pending    int `json:"pending"`
-	OldestDays int `json:"oldestDays"`
+	Pending    int   `json:"pending"`
+	OldestDays int   `json:"oldestDays"`
+	DueToday   int   `json:"dueToday"`
+	Overdue    int   `json:"overdue"`
+	NextDueAt  int64 `json:"nextDueAt"`
 }
 
 type reminderEvent struct {
@@ -42,6 +45,7 @@ type ReminderScheduler struct {
 
 	mu      sync.Mutex
 	timer   *time.Timer
+	nextAt  time.Time
 	running bool
 	last    ReminderState
 	hasLast bool
@@ -103,6 +107,7 @@ func (s *ReminderScheduler) Start() {
 func (s *ReminderScheduler) Stop() {
 	s.mu.Lock()
 	s.running = false
+	s.nextAt = time.Time{}
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
@@ -116,6 +121,7 @@ func (s *ReminderScheduler) SetEnabled(enabled bool) {
 	s.mu.Lock()
 	if !enabled {
 		s.running = false
+		s.nextAt = time.Time{}
 		if s.timer != nil {
 			s.timer.Stop()
 			s.timer = nil
@@ -129,21 +135,38 @@ func (s *ReminderScheduler) SetEnabled(enabled bool) {
 	}
 	s.running = true
 	now := s.now()
-	_, sent := s.sentToday(now)
-	next := nextReminderFire(now, sent, s.jitter)
+	next := s.nextFire(now)
 	s.scheduleAtLocked(next.Sub(now))
 	s.mu.Unlock()
 	slog.Info("待处理提醒已启用", "next", next.Format("2006-01-02 15:04"))
 	s.Refresh()
 }
 
-// Refresh 重算待处理数量；只有数值变化时才广播，避免 AI 分析更新造成的重复事件。
+// Refresh 重算待处理数量并广播；如果新增/修改的到期时间早于当前定时器，
+// 立即把下一次检查提前，保证“到期优先提醒”不只对启动时已有的数据生效。
 func (s *ReminderScheduler) Refresh() {
-	st, err := pendingSummary(s.store)
+	now := s.now()
+	st, err := pendingSummaryAt(s.store, now)
 	if err != nil {
 		return
 	}
 	s.emit(st, false)
+	s.pullDueForward(st, now)
+}
+
+func (s *ReminderScheduler) pullDueForward(st ReminderState, now time.Time) {
+	due, ok := nextDueTime(st, now)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return
+	}
+	if s.nextAt.IsZero() || due.Before(s.nextAt) {
+		s.scheduleAtLocked(due.Sub(now))
+	}
 }
 
 func (s *ReminderScheduler) emit(st ReminderState, pulse bool) {
@@ -169,6 +192,7 @@ func (s *ReminderScheduler) scheduleAtLocked(delay time.Duration) {
 	if s.timer != nil {
 		s.timer.Stop()
 	}
+	s.nextAt = s.now().Add(delay)
 	s.timer = time.AfterFunc(delay, s.tick)
 }
 
@@ -180,6 +204,7 @@ func (s *ReminderScheduler) tick() {
 	}
 	s.wg.Add(1)
 	s.timer = nil
+	s.nextAt = time.Time{}
 	s.mu.Unlock()
 	defer s.wg.Done()
 
@@ -226,8 +251,35 @@ func (s *ReminderScheduler) rescheduleNormal(now time.Time) {
 	if !s.running {
 		return
 	}
+	s.scheduleAtLocked(s.nextFire(now).Sub(now))
+}
+
+// nextDueTime 提取最近一次可提醒的具体到期时刻（忽略静默时段与已到期）。
+// 全天到期事项交给随机脉冲与悬停文案。
+func nextDueTime(st ReminderState, now time.Time) (time.Time, bool) {
+	if st.NextDueAt == 0 {
+		return time.Time{}, false
+	}
+	due := time.Unix(st.NextDueAt, 0).In(now.Location())
+	if !due.After(now) || reminderQuiet(due) {
+		return time.Time{}, false
+	}
+	return due, true
+}
+
+// nextFire 在随机脉冲之外，把最近的带具体时间的到期事项提前到候选时间。
+// 所有脉冲仍共用每日上限与静默时段；全天到期事项交给随机脉冲与悬停文案。
+func (s *ReminderScheduler) nextFire(now time.Time) time.Time {
 	_, sent := s.sentToday(now)
-	s.scheduleAtLocked(nextReminderFire(now, sent, s.jitter).Sub(now))
+	next := nextReminderFire(now, sent, s.jitter)
+	st, err := pendingSummaryAt(s.store, now)
+	if err != nil {
+		return next
+	}
+	if due, ok := nextDueTime(st, now); ok && due.Before(next) {
+		return due
+	}
+	return next
 }
 
 func (s *ReminderScheduler) rescheduleIn(delay time.Duration) {
@@ -269,19 +321,44 @@ func pendingSummary(st *store.Store) (ReminderState, error) {
 }
 
 func pendingSummaryAt(st *store.Store, now time.Time) (ReminderState, error) {
-	bugs, err := st.ListBugs()
+	items, err := st.ListBugs()
 	if err != nil {
 		return ReminderState{}, err
 	}
 	var state ReminderState
 	var oldest int64
-	for _, b := range bugs {
-		if b.Status != models.StatusTodo && b.Status != models.StatusDoing {
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	for _, b := range items {
+		if !models.IsOpen(b.Status) {
 			continue
 		}
 		state.Pending++
 		if oldest == 0 || b.CreatedAt < oldest {
 			oldest = b.CreatedAt
+		}
+		if b.DueAt <= 0 || b.Kind != models.KindTodo {
+			continue
+		}
+		due := time.Unix(b.DueAt, 0).In(now.Location())
+		if b.DueAllDay {
+			dueDay := time.Date(due.Year(), due.Month(), due.Day(), 0, 0, 0, 0, now.Location())
+			switch {
+			case dueDay.Before(today):
+				state.Overdue++
+			case dueDay.Equal(today):
+				state.DueToday++
+			}
+			continue
+		}
+		if due.Before(now) {
+			state.Overdue++
+			continue
+		}
+		if due.Year() == now.Year() && due.YearDay() == now.YearDay() {
+			state.DueToday++
+		}
+		if state.NextDueAt == 0 || due.Unix() < state.NextDueAt {
+			state.NextDueAt = due.Unix()
 		}
 	}
 	if oldest > 0 {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/lybxkl/remember-fix/internal/capture"
 	"github.com/lybxkl/remember-fix/internal/exporter"
 	"github.com/lybxkl/remember-fix/internal/fsx"
+	"github.com/lybxkl/remember-fix/internal/intent"
 	"github.com/lybxkl/remember-fix/internal/models"
 	"github.com/lybxkl/remember-fix/internal/store"
 )
@@ -34,6 +36,7 @@ type AppShell struct {
 	trigger    func()
 
 	edgeDock      string
+	edgeScreenID  string
 	edgeOffset    int
 	edgeOffsetSet bool
 	edgeStore     *store.Store
@@ -68,6 +71,22 @@ func clampInt(v, min, max int) int {
 	return v
 }
 
+// parseEdgeOffset 把保存的沿边中心坐标转成有效偏移。
+// -1 是旧版本“未设置”的哨兵值；已经保存屏幕 ID 后，负数就是副屏上的真实坐标。
+func parseEdgeOffset(raw, screenID string) (int, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, false
+	}
+	if raw == "-1" && screenID == "" {
+		return 0, false
+	}
+	return v, true
+}
+
 func (s *AppShell) initEdgePosition(st *store.Store) {
 	switch st.GetSetting("edge.dock") {
 	case "left", "top", "bottom":
@@ -75,7 +94,8 @@ func (s *AppShell) initEdgePosition(st *store.Store) {
 	default:
 		s.edgeDock = "right"
 	}
-	if v, err := strconv.Atoi(st.GetSetting("edge.offset")); err == nil && v >= 0 {
+	s.edgeScreenID = st.GetSetting("edge.screenID")
+	if v, ok := parseEdgeOffset(st.GetSetting("edge.offset"), s.edgeScreenID); ok {
 		s.edgeOffset = v
 		s.edgeOffsetSet = true
 	}
@@ -97,11 +117,30 @@ func (s *AppShell) layoutEdge(expanded bool) {
 	s.layoutEdgeLocked(expanded)
 }
 
+// edgeScreen 优先恢复到上次拖到的屏幕；屏幕被拔掉时退回窗口当前屏幕/主屏。
+// 必须在 edgeLayoutMu 内或应用启动完成前调用。
+func (s *AppShell) edgeScreen() *application.Screen {
+	if s.app == nil {
+		return nil
+	}
+	if s.edgeScreenID != "" {
+		if screen := s.app.Screen.GetByID(s.edgeScreenID); screen != nil {
+			return screen
+		}
+	}
+	if s.edgeWin != nil {
+		if screen, err := s.edgeWin.GetScreen(); err == nil && screen != nil {
+			return screen
+		}
+	}
+	return s.app.Screen.GetPrimary()
+}
+
 func (s *AppShell) layoutEdgeLocked(expanded bool) {
 	if s.edgeWin == nil || s.app == nil {
 		return
 	}
-	screen := s.app.Screen.GetPrimary()
+	screen := s.edgeScreen()
 	if screen == nil || screen.WorkArea.Width <= 0 || screen.WorkArea.Height <= 0 {
 		return
 	}
@@ -231,7 +270,12 @@ func (s *AppShell) finishEdgeDrag() {
 	if s.edgeWin == nil || s.app == nil {
 		return
 	}
-	screen := s.app.Screen.GetPrimary()
+	screen := (*application.Screen)(nil)
+	if current, err := s.edgeWin.GetScreen(); err == nil && current != nil {
+		screen = current
+	} else {
+		screen = s.app.Screen.GetPrimary()
+	}
 	if screen == nil || screen.WorkArea.Width <= 0 || screen.WorkArea.Height <= 0 {
 		return
 	}
@@ -243,12 +287,14 @@ func (s *AppShell) finishEdgeDrag() {
 	dock, offset := edgeDockTarget(screen.WorkArea, x, y, width, height)
 	s.edgeLayoutMu.Lock()
 	s.edgeDock = dock
+	s.edgeScreenID = screen.ID
 	s.edgeOffset = offset
 	s.edgeOffsetSet = true
 	s.layoutEdgeLocked(true)
 	s.edgeLayoutMu.Unlock()
 	if s.edgeStore != nil {
 		_ = s.edgeStore.SetSetting("edge.dock", dock)
+		_ = s.edgeStore.SetSetting("edge.screenID", screen.ID)
 		_ = s.edgeStore.SetSetting("edge.offset", strconv.Itoa(offset))
 	}
 	emit("edge:dock", dock)
@@ -430,7 +476,7 @@ func (s *EdgeService) ReminderState() (ReminderState, error) {
 	return pendingSummary(s.store)
 }
 
-// OpenBoard 收起宠物并打开主窗，切换到「只看待处理」筛选。
+// OpenBoard 收起宠物并打开主窗；有逾期/今日到期时优先过滤到期事项，否则只看待处理。
 func (s *EdgeService) OpenBoard() error {
 	if s.shell == nil {
 		return errors.New("应用尚未就绪")
@@ -439,11 +485,56 @@ func (s *EdgeService) OpenBoard() error {
 	s.shell.layoutEdge(false)
 	emit("edge:collapse", nil)
 	s.shell.ShowMain()
-	emit("ui:open-pending", nil)
+	due := ""
+	if st, err := pendingSummary(s.store); err == nil {
+		if st.Overdue > 0 {
+			due = "overdue"
+		} else if st.DueToday > 0 {
+			due = "today"
+		}
+	}
+	emit("ui:open-pending", map[string]string{"due": due})
 	return nil
 }
 
-// ─── Bug 服务 ───
+// ─── 事项服务 ───
+
+type DetectRequest struct {
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	SourceApp string `json:"sourceApp"`
+	HasImage  bool   `json:"hasImage"`
+}
+
+type kindChangedEvent struct {
+	ID         string  `json:"id"`
+	Title      string  `json:"title"`
+	From       string  `json:"from"`
+	To         string  `json:"to"`
+	FromStatus string  `json:"fromStatus"`
+	FromDueAt  int64   `json:"fromDueAt"`
+	ToDueAt    int64   `json:"toDueAt"`
+	Confidence float64 `json:"confidence"`
+}
+
+// KindChangeUndo 是看板撤销 AI 改型时回传的副作用快照。
+type KindChangeUndo struct {
+	ID         string `json:"id"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	FromStatus string `json:"fromStatus"`
+	FromDueAt  int64  `json:"fromDueAt"`
+	ToDueAt    int64  `json:"toDueAt"`
+}
+
+// kindUndoneEvent 让打开中的详情抽屉同步撤销后的类型/状态/到期。
+type kindUndoneEvent struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Status    string `json:"status"`
+	DueAt     int64  `json:"dueAt"`
+	DueAllDay bool   `json:"dueAllDay"`
+}
 
 type BugService struct {
 	store     *store.Store
@@ -465,14 +556,51 @@ func (s *BugService) Get(id string) (*models.Bug, error) {
 	return s.store.GetBug(id)
 }
 
+// DetectIntent 供捕获窗在输入时实时显示类型；模糊时沿用上次保存的类型。
+func (s *BugService) DetectIntent(req DetectRequest) intent.Result {
+	return intent.Detect(intent.Input{
+		Title:     req.Title,
+		Body:      req.Body,
+		SourceApp: req.SourceApp,
+		HasImage:  req.HasImage,
+		LastKind:  s.store.GetSetting("capture.lastKind"),
+	})
+}
+
 // Save 保存（新建 id 为空则生成）。仅新建记录触发自动 AI 分析，编辑不重复分析。
 func (s *BugService) Save(b *models.Bug) (*models.Bug, error) {
 	if b == nil {
-		return nil, errors.New("bug 不能为空")
+		return nil, errors.New("记录不能为空")
 	}
 	isNew := strings.TrimSpace(b.ID) == ""
-	if err := s.store.SaveBug(b); err != nil {
-		return nil, err
+	if isNew && !models.ValidKind(b.Kind) {
+		res := s.DetectIntent(DetectRequest{Title: b.Title, Body: b.DescriptionText, SourceApp: b.SourceApp, HasImage: hasImage(b)})
+		b.Kind = res.Kind
+	}
+	if !models.ValidKind(b.Kind) {
+		b.Kind = models.KindBug
+	}
+	if !models.ValidKindSource(b.KindSource) {
+		b.KindSource = models.KindSourceHeuristic
+	}
+	if b.Kind == models.KindTodo && b.Status == models.StatusVerified {
+		b.Status = models.StatusFixed
+	}
+	if isNew {
+		if err := s.store.SaveBug(b); err != nil {
+			return nil, err
+		}
+	} else {
+		ok, err := s.store.UpdateBug(b)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errors.New("记录不存在或已被删除")
+		}
+	}
+	if isNew {
+		_ = s.store.SetSetting("capture.lastKind", b.Kind)
 	}
 	saved, err := s.store.GetBug(b.ID)
 	if err != nil {
@@ -486,13 +614,26 @@ func (s *BugService) Save(b *models.Bug) (*models.Bug, error) {
 	return saved, nil
 }
 
-func (s *BugService) UpdateStatus(id, status string) error {
-	valid := map[string]bool{
-		models.StatusTodo: true, models.StatusDoing: true, models.StatusFixed: true,
-		models.StatusVerified: true, models.StatusWontfix: true,
+func hasImage(b *models.Bug) bool {
+	for _, att := range b.Attachments {
+		if att.Type == "image" && att.Path != "" {
+			return true
+		}
 	}
-	if !valid[status] {
+	return false
+}
+
+func (s *BugService) UpdateStatus(id, status string) error {
+	if !models.ValidStatus(status) {
 		return errors.New("无效的状态")
+	}
+	b, err := s.store.GetBug(id)
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+	// 待办没有「已验证」，合并到「已完成」，避免看板出现空列。
+	if b.Kind == models.KindTodo && status == models.StatusVerified {
+		status = models.StatusFixed
 	}
 	if err := s.store.UpdateStatus(id, status); err != nil {
 		return err
@@ -502,6 +643,82 @@ func (s *BugService) UpdateStatus(id, status string) error {
 	}
 	s.refreshReminders()
 	return nil
+}
+
+// SetKind 切换类型；lock=true 表示用户手动决定（含撤销），之后 AI 不再自动改。
+func (s *BugService) SetKind(id, kind string, lock bool) error {
+	if !models.ValidKind(kind) {
+		return errors.New("无效的类型")
+	}
+	b, err := s.store.GetBug(id)
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+	source := models.KindSourceAI
+	if lock {
+		source = models.KindSourceUser
+	}
+	if b.Kind == kind && (!lock || b.KindSource == models.KindSourceUser) {
+		return nil
+	}
+	if err := s.store.UpdateKind(id, kind, source); err != nil {
+		return err
+	}
+	if fresh, err := s.store.GetBug(id); err == nil {
+		emit("bug:changed", fresh)
+	}
+	s.refreshReminders()
+	return nil
+}
+
+// UndoKindChange 撤销一次 AI 自动改型。除了类型，还会还原 AI 造成的
+// 已验证→已完成映射和 AI 自动补的到期时间；用户之后改过的字段保持不动。
+func (s *BugService) UndoKindChange(req KindChangeUndo) error {
+	if !models.ValidKind(req.From) || !models.ValidKind(req.To) || req.From == req.To {
+		return errors.New("无效的撤销请求")
+	}
+	b, err := s.store.GetBug(req.ID)
+	if err != nil {
+		return errors.New("记录不存在")
+	}
+	if b.KindSource != models.KindSourceAI || b.Kind != req.To {
+		return errors.New("记录已发生变化，无法撤销")
+	}
+
+	status := b.Status
+	if models.ValidStatus(req.FromStatus) && b.Status != req.FromStatus &&
+		b.Status == kindStatusAfterSwitch(req.FromStatus, req.To) {
+		status = req.FromStatus
+	}
+	dueAt, dueAllDay := b.DueAt, b.DueAllDay
+	if req.To == models.KindTodo && req.FromDueAt == 0 && req.ToDueAt > 0 && b.DueAt == req.ToDueAt {
+		dueAt, dueAllDay = 0, false
+	}
+
+	ok, err := s.store.UndoKindSwitch(req.ID, req.From, status, dueAt, dueAllDay)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("记录已发生变化，无法撤销")
+	}
+	if fresh, err := s.store.GetBug(req.ID); err == nil {
+		emit("bug:changed", fresh)
+		emit("bug:kind-undone", kindUndoneEvent{
+			ID: fresh.ID, Kind: fresh.Kind, Status: fresh.Status,
+			DueAt: fresh.DueAt, DueAllDay: fresh.DueAllDay,
+		})
+	}
+	s.refreshReminders()
+	return nil
+}
+
+// kindStatusAfterSwitch 是 AI 自动改型时对状态的唯一映射：待办没有「已验证」。
+func kindStatusAfterSwitch(status, toKind string) string {
+	if toKind == models.KindTodo && status == models.StatusVerified {
+		return models.StatusFixed
+	}
+	return status
 }
 
 func (s *BugService) Delete(id string) error {
@@ -521,7 +738,10 @@ func (s *BugService) refreshReminders() {
 
 // Reanalyze 手动重新触发 AI 分析。
 func (s *BugService) Reanalyze(id string) error {
-	_, key, model, _ := s.aiConfig()
+	_, key, model, enabled := s.aiConfig()
+	if !enabled {
+		return errors.New("AI 分析已在设置中关闭，请先启用")
+	}
 	if key == "" || model == "" {
 		return errors.New("请先在设置里配置 AI API Key 与模型")
 	}
@@ -534,7 +754,10 @@ func (s *BugService) Reanalyze(id string) error {
 
 // AnalyzeUnanalyzed 批量分析所有尚未成功分析过的记录，返回本次排队数量。
 func (s *BugService) AnalyzeUnanalyzed() (int, error) {
-	_, key, model, _ := s.aiConfig()
+	_, key, model, enabled := s.aiConfig()
+	if !enabled {
+		return 0, errors.New("AI 分析已在设置中关闭，请先启用")
+	}
 	if key == "" || model == "" {
 		return 0, errors.New("请先在设置里配置 AI API Key 与模型")
 	}
@@ -569,7 +792,7 @@ func (s *BugService) ExportMarkdown() (string, error) {
 }
 
 // analyzeAsync 后台执行 AI 分析：pending → done/failed，并广播事件。
-// AI 结果只填充空白字段，用户手动输入的内容永不被覆盖。
+// AI 结果只填充空白字段；未手动锁定类型时，高置信类型判断会自动切换并支持撤销。
 func (s *BugService) analyzeAsync(id string) {
 	if _, loaded := s.analyzing.LoadOrStore(id, struct{}{}); loaded {
 		return
@@ -578,21 +801,21 @@ func (s *BugService) analyzeAsync(id string) {
 
 	baseURL, key, model, enabled := s.aiConfig()
 	if !enabled || key == "" || model == "" {
-		slog.Info("跳过 AI 分析：未启用或未配置", "bug", id)
+		slog.Info("跳过 AI 分析：未启用或未配置", "item", id)
 		return
 	}
-	bug, err := s.store.GetBug(id)
+	item, err := s.store.GetBug(id)
 	if err != nil {
 		return
 	}
-	wasAutoTitle := strings.TrimSpace(bug.Title) == ""
+	wasAutoTitle := strings.TrimSpace(item.Title) == ""
 	_ = s.store.SetAIStatus(id, models.AIPending)
 	if pending, err := s.store.GetBug(id); err == nil {
 		emit("bug:changed", pending)
 	}
 
 	var paths []string
-	for _, att := range bug.Attachments {
+	for _, att := range item.Attachments {
 		if att.Type == "image" && att.Path != "" {
 			if p := fsx.AbsPath(s.dataDir, att.Path); p != "" {
 				paths = append(paths, p)
@@ -600,9 +823,9 @@ func (s *BugService) analyzeAsync(id string) {
 		}
 	}
 	client := ai.NewClient(baseURL, key, model)
-	sugg, err := ai.AnalyzeBug(context.Background(), client, bug, paths)
+	sugg, err := ai.AnalyzeBug(context.Background(), client, item, paths)
 	if err != nil {
-		slog.Warn("AI 分析失败", "bug", id, "model", model, "err", err)
+		slog.Warn("AI 分析失败", "item", id, "model", model, "err", err)
 		_ = s.store.SetAIStatus(id, models.AIFailed)
 		if b2, err2 := s.store.GetBug(id); err2 == nil {
 			emit("bug:changed", b2)
@@ -610,18 +833,32 @@ func (s *BugService) analyzeAsync(id string) {
 		return
 	}
 
-	_ = s.store.UpdateAI(id, sugg, models.AIDone)
 	fresh, err := s.store.GetBug(id)
 	if err != nil {
 		return
 	}
+	fresh.AI = sugg
+	fresh.AIStatus = models.AIDone
 	if strings.TrimSpace(fresh.Title) == "" && strings.TrimSpace(sugg.Title) != "" {
 		fresh.Title = strings.TrimSpace(sugg.Title)
 	}
 	if fresh.Title == "" {
 		fresh.Title = fallbackTitle(fresh)
 	}
-	if fresh.Category == "" || fresh.Category == models.CategoryUncategorized {
+	fromKind, fromStatus := "", ""
+	fromDueAt := int64(0)
+	if fresh.KindSource != models.KindSourceUser && models.ValidKind(sugg.Kind) &&
+		sugg.Kind != fresh.Kind && sugg.KindConfidence >= 0.8 {
+		fromKind = fresh.Kind
+		fromStatus = fresh.Status
+		fromDueAt = fresh.DueAt
+		fresh.Kind = sugg.Kind
+		fresh.KindSource = models.KindSourceAI
+		if fresh.Kind == models.KindTodo && fresh.Status == models.StatusVerified {
+			fresh.Status = models.StatusFixed
+		}
+	}
+	if fresh.Kind == models.KindBug && (fresh.Category == "" || fresh.Category == models.CategoryUncategorized) {
 		if sugg.Category != "" {
 			fresh.Category = sugg.Category
 		}
@@ -634,9 +871,44 @@ func (s *BugService) analyzeAsync(id string) {
 			fresh.Severity = sugg.Severity
 		}
 	}
-	_ = s.store.SaveBug(fresh)
-	if final, err := s.store.GetBug(id); err == nil {
-		emit("bug:changed", final)
+	dueFilled := false
+	if fresh.Kind == models.KindTodo && fresh.DueAt == 0 && sugg.DueAt > 0 {
+		fresh.DueAt = sugg.DueAt
+		fresh.DueAllDay = sugg.DueAllDay
+		dueFilled = true
+	}
+	toDueAt := int64(0)
+	if dueFilled {
+		toDueAt = fresh.DueAt
+	}
+	ok, err := s.store.UpdateBug(fresh)
+	if err != nil {
+		slog.Warn("保存 AI 分析结果失败", "item", id, "err", err)
+		_ = s.store.SetAIStatus(id, models.AIFailed)
+		if b, err := s.store.GetBug(id); err == nil {
+			emit("bug:changed", b)
+		}
+		return
+	}
+	if !ok {
+		slog.Info("跳过 AI 结果回写：记录已删除", "item", id)
+		return
+	}
+	final, err := s.store.GetBug(id)
+	if err != nil {
+		final = fresh
+	}
+	emit("bug:changed", final)
+	if dueFilled || fromKind != "" {
+		s.refreshReminders()
+	}
+	if fromKind != "" {
+		slog.Info("AI 自动切换事项类型", "item", id, "from", fromKind, "to", final.Kind, "confidence", sugg.KindConfidence)
+		emit("bug:kind-changed", kindChangedEvent{
+			ID: id, Title: final.Title, From: fromKind, To: final.Kind,
+			FromStatus: fromStatus, FromDueAt: fromDueAt, ToDueAt: toDueAt,
+			Confidence: sugg.KindConfidence,
+		})
 	}
 }
 
@@ -645,6 +917,9 @@ func (s *BugService) GenerateFixPrompt(id string) (string, error) {
 	b, err := s.store.GetBug(id)
 	if err != nil {
 		return "", err
+	}
+	if b.Kind == models.KindTodo {
+		return "", errors.New("待办事项没有修复指令")
 	}
 	baseURL, key, model, _ := s.aiConfig()
 	if key == "" || model == "" {
@@ -710,7 +985,7 @@ func fallbackTitle(b *models.Bug) string {
 			}
 		}
 	}
-	return "未命名 Bug"
+	return "未命名事项"
 }
 
 // ─── 配置服务 ───
@@ -821,4 +1096,22 @@ func (s *ConfigService) CopyText(text string) bool {
 		return false
 	}
 	return s.shell.app.Clipboard.SetText(text)
+}
+
+// OpenURL 只允许 http/https，并用系统默认浏览器打开，避免 AI 输出里的链接
+// 直接把看板 WebView 导航走。
+func (s *ConfigService) OpenURL(raw string) bool {
+	if !validExternalURL(raw) || s.shell == nil || s.shell.app == nil {
+		return false
+	}
+	return s.shell.app.Browser.OpenURL(strings.TrimSpace(raw)) == nil
+}
+
+func validExternalURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return scheme == "http" || scheme == "https"
 }

@@ -64,7 +64,7 @@ func main() {
 
 	app := application.New(application.Options{
 		Name:        "记得修",
-		Description: "截屏记录 Bug，看板管理，AI 自动分类",
+		Description: "截屏记录 Bug 与待办，看板管理，AI 自动分类",
 		Icon:        appIcon,
 		Logger:      logger,
 		LogLevel:    slog.LevelInfo,
@@ -95,6 +95,13 @@ func main() {
 		},
 	})
 	shell.app = app
+	// 放在 application.New 之后：第二实例会在这里之前被单实例保护拦下退出，
+	// 不会把正在运行的主实例的分析状态误标为失败。
+	if n, err := st.ResetInFlightAI(); err != nil {
+		slog.Warn("清理遗留 AI 状态失败", "err", err)
+	} else if n > 0 {
+		slog.Info("已将上次未完成的 AI 分析标记为失败", "count", n)
+	}
 
 	setupWindows(app, shell)
 	setupTray(app, capSvc, shell)
@@ -149,7 +156,7 @@ func main() {
 func setupWindows(app *application.App, shell *AppShell) {
 	mainWin := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "main",
-		Title:            "记得修 · Bug 看板",
+		Title:            "记得修 · 事项看板",
 		Width:            1200,
 		Height:           720,
 		MinWidth:         980,
@@ -188,11 +195,11 @@ func setupWindows(app *application.App, shell *AppShell) {
 
 	captureWin := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "capture",
-		Title:            "记一条 Bug",
+		Title:            "记一条",
 		Width:            500,
-		Height:           680,
+		Height:           710,
 		MinWidth:         460,
-		MinHeight:        600,
+		MinHeight:        620,
 		URL:              "/capture.html",
 		Frameless:        true,
 		AlwaysOnTop:      true,
@@ -297,12 +304,12 @@ func setupTray(app *application.App, capSvc *CaptureService, shell *AppShell) {
 	} else {
 		tray.SetIcon(trayIcon)
 	}
-	tray.SetTooltip("记得修 · 截屏记 Bug")
+	tray.SetTooltip("记得修 · 截屏记 Bug 与待办")
 	tray.OnClick(func() {
 		capSvc.Trigger()
 	})
 	menu := app.NewMenu()
-	menu.Add("记一条 Bug").OnClick(func(*application.Context) {
+	menu.Add("记一条").OnClick(func(*application.Context) {
 		capSvc.Trigger()
 	})
 	menu.Add("打开看板").OnClick(func(*application.Context) {
@@ -330,7 +337,7 @@ func setupMacMenu(app *application.App, capSvc *CaptureService, shell *AppShell)
 	menu.AddRole(application.WindowMenu)
 
 	record := menu.AddSubmenu("记录")
-	record.Add("记一条 Bug").OnClick(func(*application.Context) {
+	record.Add("记一条").OnClick(func(*application.Context) {
 		capSvc.Trigger()
 	})
 	record.Add("打开看板").OnClick(func(*application.Context) {

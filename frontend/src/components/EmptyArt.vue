@@ -53,10 +53,10 @@ defineEmits<{ (e: 'record'): void }>()
 
     <div class="title">桌面很干净，像刚下班</div>
     <div class="sub">
-      按 <kbd>{{ hotkey || defaultHotkey }}</kbd> 或点托盘 / 菜单栏图标，把刚截的图记成一条 Bug
+      按 <kbd>{{ hotkey || defaultHotkey }}</kbd> 或点托盘 / 菜单栏图标，把刚截的图、报错或待办记下来
     </div>
     <button class="record" @click="$emit('record')">记第一条</button>
-    <div class="mini">也可以先复制一段报错日志</div>
+    <div class="mini">截图、报错日志、容易忘的事都可以</div>
   </div>
 </template>
 

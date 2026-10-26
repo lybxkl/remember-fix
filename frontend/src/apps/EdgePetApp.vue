@@ -8,6 +8,9 @@ type Dock = 'right' | 'left' | 'top' | 'bottom'
 interface ReminderState {
   pending?: number
   oldestDays?: number
+  dueToday?: number
+  overdue?: number
+  nextDueAt?: number
   pulse?: boolean
 }
 
@@ -19,13 +22,18 @@ const dock = ref<Dock>('right')
 const hotkey = ref(defaultHotkey)
 const pending = ref(0)
 const oldestDays = ref(0)
+const dueToday = ref(0)
+const overdue = ref(0)
 const pulsing = ref(false)
 const shellEl = ref<HTMLElement | null>(null)
 let leaveTimer: number | undefined
 let dragEndTimer: number | undefined
 let pulseTimer: number | undefined
 let pulseFrame: number | undefined
-let reminderEventSeen = false
+let dueTimer: number | undefined
+let midnightTimer: number | undefined
+let reminderEventVersion = 0
+let reminderLoadSeq = 0
 let offCollapse: (() => void) | undefined
 let offDock: (() => void) | undefined
 let offDragEnd: (() => void) | undefined
@@ -42,28 +50,53 @@ function isDock(value: unknown): value is Dock {
 }
 
 const hasPending = computed(() => pending.value > 0)
+const hasOverdue = computed(() => overdue.value > 0)
+const hasDueToday = computed(() => dueToday.value > 0)
 const badgeLabel = computed(() => (pending.value > 9 ? '9+' : String(pending.value)))
-const reminderSub = computed(() =>
-  oldestDays.value > 0 ? `最久的一条 ${oldestDays.value} 天了` : '都是今天刚记的',
+const reminderKicker = computed(() =>
+  hasOverdue.value
+    ? 'OVERDUE / 已逾期'
+    : hasDueToday.value
+      ? 'TODAY / 今天'
+      : hasPending.value
+        ? 'REMINDER / 未完成'
+        : 'REMEMBER / EVERYTHING',
 )
+const reminderTitle = computed(() => {
+  if (hasOverdue.value) return `${overdue.value} 条已逾期`
+  if (hasDueToday.value) return `今天有 ${dueToday.value} 件要办`
+  return hasPending.value ? `${pending.value} 条还挂着` : '又想起一件事？'
+})
+const reminderSub = computed(() => {
+  if (hasOverdue.value) return `共 ${pending.value} 条未完成`
+  if (hasDueToday.value) return `总共 ${pending.value} 条未完成`
+  return oldestDays.value > 0 ? `最久的一条 ${oldestDays.value} 天了` : '都是今天刚记的'
+})
 const recordLabel = computed(() =>
   hasPending.value
-    ? `${pending.value} 条待处理；点击记一条 Bug，按住可拖动位置`
-    : '记一条 Bug，按住可拖动调整位置',
+    ? `${pending.value} 条未完成；点击记一条，按住可拖动位置`
+    : '记一条，按住可拖动调整位置',
 )
 const announcement = computed(() => {
-  if (!hasPending.value) return '没有待处理记录'
+  if (hasOverdue.value) return `${overdue.value} 条已逾期，共 ${pending.value} 条未完成`
+  if (hasDueToday.value) return `今天有 ${dueToday.value} 件要办，共 ${pending.value} 条未完成`
+  if (!hasPending.value) return '没有未完成记录'
   return oldestDays.value > 0
-    ? `${pending.value} 条待处理，最久 ${oldestDays.value} 天`
-    : `${pending.value} 条待处理，都是今天记的`
+    ? `${pending.value} 条未完成，最久 ${oldestDays.value} 天`
+    : `${pending.value} 条未完成，都是今天记的`
 })
 
 function applyReminder(data: ReminderState | null) {
   if (!data) return
   const count = Number(data.pending)
   const age = Number(data.oldestDays)
+  const today = Number(data.dueToday)
+  const late = Number(data.overdue)
   pending.value = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
   oldestDays.value = Number.isFinite(age) && age > 0 ? Math.floor(age) : 0
+  dueToday.value = Number.isFinite(today) && today > 0 ? Math.floor(today) : 0
+  overdue.value = Number.isFinite(late) && late > 0 ? Math.floor(late) : 0
+  scheduleDueRefresh(Number(data.nextDueAt))
   if (!hasPending.value) {
     if (pulseTimer) window.clearTimeout(pulseTimer)
     if (pulseFrame) window.cancelAnimationFrame(pulseFrame)
@@ -73,6 +106,36 @@ function applyReminder(data: ReminderState | null) {
   } else if (data.pulse) {
     playPulse()
   }
+}
+
+// 到点后“今日到期”会变成“已逾期”，即使提醒关闭也要刷新徽标文案。
+function scheduleDueRefresh(nextDueAt: number) {
+  if (dueTimer) {
+    window.clearTimeout(dueTimer)
+    dueTimer = undefined
+  }
+  if (!Number.isFinite(nextDueAt) || nextDueAt <= 0) return
+  const delay = Math.min(
+    Math.max(nextDueAt * 1000 - Date.now() + 1500, 1000),
+    12 * 60 * 60 * 1000,
+  )
+  dueTimer = window.setTimeout(() => {
+    dueTimer = undefined
+    loadReminder()
+  }, delay)
+}
+
+// 全天到期与“今天/逾期”的天数口径在午夜切换；每天刷新一次即可。
+function scheduleMidnightRefresh() {
+  if (midnightTimer) window.clearTimeout(midnightTimer)
+  const now = new Date()
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 2)
+  const delay = Math.max(next.getTime() - now.getTime(), 1000)
+  midnightTimer = window.setTimeout(() => {
+    midnightTimer = undefined
+    loadReminder()
+    scheduleMidnightRefresh()
+  }, delay)
 }
 
 function playPulse() {
@@ -91,10 +154,13 @@ function playPulse() {
 }
 
 async function loadReminder() {
+  const seq = ++reminderLoadSeq
+  const version = reminderEventVersion
   try {
     const state = await call<ReminderState>('main.EdgeService.ReminderState')
-    // 挂载期间如果已有新事件到达，以事件为准，避免旧请求覆盖新状态。
-    if (!reminderEventSeen) applyReminder(state)
+    // 事件或更新的一次请求优先，避免旧响应覆盖新状态。
+    if (seq !== reminderLoadSeq || version !== reminderEventVersion) return
+    applyReminder(state)
   } catch {
     /* 保持无待处理显示 */
   }
@@ -113,12 +179,13 @@ async function loadConfig() {
 onMounted(() => {
   loadConfig()
   loadReminder()
+  scheduleMidnightRefresh()
   offCollapse = onEvent('edge:collapse', () => { expanded.value = false })
   offDock = onEvent<unknown>('edge:dock', (value) => {
     if (isDock(value)) dock.value = value
   })
   offReminder = onEvent<ReminderState | null>('edge:reminder', (data) => {
-    reminderEventSeen = true
+    reminderEventVersion++
     applyReminder(data)
   })
   // Windows 原生拖动期间 WebView 收不到 pointerup，由后端吸附完成后通知复位。
@@ -139,6 +206,8 @@ onBeforeUnmount(() => {
   if (dragEndTimer) window.clearTimeout(dragEndTimer)
   if (pulseTimer) window.clearTimeout(pulseTimer)
   if (pulseFrame) window.cancelAnimationFrame(pulseFrame)
+  if (dueTimer) window.clearTimeout(dueTimer)
+  if (midnightTimer) window.clearTimeout(midnightTimer)
   offCollapse?.()
   offDock?.()
   offDragEnd?.()
@@ -182,6 +251,7 @@ async function onEnter() {
   cancelLeave()
   cancelDragEndCheck()
   loadConfig()
+  loadReminder()
   if (expanded.value) return
   await ensureExpanded()
 }
@@ -350,9 +420,11 @@ function onPointerCancel(e: PointerEvent) {
         @keydown="onKey"
       >
         <div class="pet-bubble">
-          <span class="bubble-kicker">{{ hasPending ? 'REMINDER / 待处理' : 'REMEMBER / FIX' }}</span>
-          <strong>{{ hasPending ? `${pending} 条还挂着` : '又发现 Bug 了？' }}</strong>
-          <span class="bubble-sub">{{ hasPending ? reminderSub : '点一下，把刚遇到的情况记下来' }}</span>
+          <span class="bubble-kicker">{{ reminderKicker }}</span>
+          <strong>{{ reminderTitle }}</strong>
+          <span class="bubble-sub">
+            {{ hasPending || hasOverdue ? reminderSub : '点一下，把刚遇到的事记下来' }}
+          </span>
         </div>
 
       <div class="pet-stage" aria-hidden="true">
@@ -427,7 +499,7 @@ function onPointerCancel(e: PointerEvent) {
         v-if="hasPending"
         type="button"
         class="bubble-link"
-        title="打开看板，只看待处理"
+        title="打开看板，查看未完成事项"
         @pointerdown.stop
         @pointerup.stop
         @click.stop="openBoard"
@@ -442,10 +514,15 @@ function onPointerCancel(e: PointerEvent) {
       role="button"
       tabindex="0"
       :aria-label="recordLabel"
-      title="点击记一条 Bug，按住可拖动位置"
+      title="点击记一条，按住可拖动位置"
       @keydown="onKey"
     >
-      <span v-if="hasPending" class="edge-badge" aria-hidden="true">{{ badgeLabel }}</span>
+      <span
+        v-if="hasPending"
+        class="edge-badge"
+        :class="{ overdue: hasOverdue, today: hasDueToday && !hasOverdue }"
+        aria-hidden="true"
+      >{{ badgeLabel }}</span>
       <svg viewBox="0 0 20 26" fill="none" aria-hidden="true">
         <g stroke="#fff8ea" stroke-width="1.35" stroke-linecap="round">
           <path d="M7 6 4.5 3.5M13 6 15.5 3.5" />
@@ -555,6 +632,17 @@ html, body, #app {
   font-variant-numeric: tabular-nums;
   box-shadow: 0 2px 7px rgba(76, 62, 43, 0.2);
   pointer-events: none;
+}
+.edge-badge.overdue {
+  background: var(--rf-danger);
+  color: #fff8ea;
+  border-color: rgba(148, 52, 44, 0.75);
+  box-shadow: 0 2px 8px rgba(180, 63, 54, 0.35);
+}
+.edge-badge.today {
+  background: #fff1d2;
+  color: #8f520d;
+  border-color: rgba(168, 99, 19, 0.55);
 }
 .edge-shell.dock-right .edge-badge { top: 1px; left: 2px; }
 .edge-shell.dock-left .edge-badge { top: 1px; right: 2px; }

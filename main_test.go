@@ -9,6 +9,48 @@ import (
 	"testing"
 )
 
+func TestParseEdgeOffset(t *testing.T) {
+	cases := []struct {
+		raw    string
+		screen string
+		want   int
+		wantOK bool
+	}{
+		{"", "", 0, false},
+		{"-1", "", 0, false},
+		{"-1", "screen-2", -1, true},
+		{"-960", "", -960, true},
+		{"540", "screen-1", 540, true},
+		{"abc", "screen-1", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := parseEdgeOffset(tc.raw, tc.screen)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("parseEdgeOffset(%q,%q) = (%d,%v), want (%d,%v)",
+				tc.raw, tc.screen, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func TestValidExternalURL(t *testing.T) {
+	cases := map[string]bool{
+		"https://example.com/a":     true,
+		"HTTP://example.com":        true,
+		"http://localhost:5178":     true,
+		"javascript:alert(1)":       false,
+		"file:///etc/passwd":        false,
+		"data:text/html,hello":      false,
+		"//example.com/path":        false,
+		"https://":                  false,
+		"  https://example.com/x  ": true,
+	}
+	for raw, want := range cases {
+		if got := validExternalURL(raw); got != want {
+			t.Errorf("validExternalURL(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
 func TestAssetHandlerOnlyServesShotImages(t *testing.T) {
 	dataDir := t.TempDir()
 	shotsDir := filepath.Join(dataDir, "shots", "2026", "10")

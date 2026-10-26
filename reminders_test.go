@@ -174,3 +174,116 @@ func TestPendingSummary(t *testing.T) {
 		t.Fatalf("全部修完后应为空: %+v", got)
 	}
 }
+
+func TestPendingSummaryDue(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	at := func(day, hour int) time.Time {
+		return time.Date(2026, 10, day, hour, 0, 0, 0, time.UTC)
+	}
+	save := func(id, kind, status string, due time.Time, allDay bool) {
+		t.Helper()
+		b := &models.Bug{ID: id, Kind: kind, Status: status, CreatedAt: now.Unix()}
+		if !due.IsZero() {
+			b.DueAt = due.Unix()
+			b.DueAllDay = allDay
+		}
+		if err := st.SaveBug(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("overdue-timed", models.KindTodo, models.StatusTodo, at(26, 10), false)
+	save("overdue-day", models.KindTodo, models.StatusDoing, at(25, 0), true)
+	save("today-timed", models.KindTodo, models.StatusTodo, at(26, 18), false)
+	save("today-day", models.KindTodo, models.StatusTodo, at(26, 0), true)
+	save("tomorrow", models.KindTodo, models.StatusTodo, at(27, 9), false)
+	save("later-today", models.KindTodo, models.StatusTodo, at(26, 20), false)
+	save("done", models.KindTodo, models.StatusFixed, at(26, 9), false)
+	save("bug-with-due", models.KindBug, models.StatusTodo, at(26, 9), false)
+
+	got, err := pendingSummaryAt(st, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Pending != 7 || got.Overdue != 2 || got.DueToday != 3 {
+		t.Fatalf("unexpected counts: %+v", got)
+	}
+	if want := at(26, 18).Unix(); got.NextDueAt != want {
+		t.Fatalf("NextDueAt = %d, want %d (%+v)", got.NextDueAt, want, got)
+	}
+}
+
+func TestNextFireHonorsDueTime(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	due := now.Add(20 * time.Minute)
+	b := &models.Bug{Kind: models.KindTodo, Status: models.StatusTodo, DueAt: due.Unix(), CreatedAt: now.Unix()}
+	if err := st.SaveBug(b); err != nil {
+		t.Fatal(err)
+	}
+	s := newReminderScheduler(st, nil)
+	s.now = func() time.Time { return now }
+	s.jitter = minJitter
+	if got := s.nextFire(now); !got.Equal(due) {
+		t.Fatalf("nextFire = %s, want due time %s", got, due)
+	}
+}
+
+func TestRefreshPullsNewDueForward(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	s := newReminderScheduler(st, nil)
+	s.now = func() time.Time { return now }
+	s.jitter = minJitter
+	s.SetEnabled(true)
+	defer s.Stop()
+	if got, want := scheduledAt(s), now.Add(45*time.Minute); !got.Equal(want) {
+		t.Fatalf("normal reminder scheduled at %s, want %s", got, want)
+	}
+
+	due := now.Add(20 * time.Minute)
+	item := &models.Bug{
+		Kind: models.KindTodo, KindSource: models.KindSourceUser, Status: models.StatusTodo,
+		DueAt: due.Unix(), CreatedAt: now.Unix(),
+	}
+	if err := st.SaveBug(item); err != nil {
+		t.Fatal(err)
+	}
+	s.Refresh()
+	if got := scheduledAt(s); !got.Equal(due) {
+		t.Fatalf("new due should pull reminder forward to %s, got %s", due, got)
+	}
+
+	later := &models.Bug{
+		Kind: models.KindTodo, KindSource: models.KindSourceUser, Status: models.StatusTodo,
+		DueAt: now.Add(3 * time.Hour).Unix(), CreatedAt: now.Unix(),
+	}
+	if err := st.SaveBug(later); err != nil {
+		t.Fatal(err)
+	}
+	s.Refresh()
+	if got := scheduledAt(s); !got.Equal(due) {
+		t.Fatalf("a later due must not push the timer back, got %s", got)
+	}
+}
+
+func scheduledAt(s *ReminderScheduler) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nextAt
+}

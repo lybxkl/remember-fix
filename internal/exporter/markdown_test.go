@@ -23,6 +23,7 @@ func TestMarkdownCopiesScreenshotsAndIncludesAI(t *testing.T) {
 
 	bug := &models.Bug{
 		ID:              "bug-1",
+		Kind:            models.KindBug,
 		Title:           "保存按钮崩溃",
 		DescriptionText: "点击保存后闪退",
 		Status:          models.StatusTodo,
@@ -41,8 +42,20 @@ func TestMarkdownCopiesScreenshotsAndIncludesAI(t *testing.T) {
 			Steps:   []string{"打开页面", "点击保存"},
 		},
 	}
+	todo := &models.Bug{
+		ID:              "todo-1",
+		Kind:            models.KindTodo,
+		Title:           "交房租",
+		Status:          models.StatusTodo,
+		Severity:        "P1",
+		DueAt:           time.Date(2026, 11, 2, 0, 0, 0, 0, time.Local).Unix(),
+		DueAllDay:       true,
+		CreatedAt:       time.Now().Unix(),
+		Attachments:     []models.Attachment{},
+		DescriptionText: "下周一之前交房租",
+	}
 
-	file, err := Markdown(dataDir, []*models.Bug{bug})
+	file, err := Markdown(dataDir, []*models.Bug{bug, todo})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +64,10 @@ func TestMarkdownCopiesScreenshotsAndIncludesAI(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(content)
-	for _, want := range []string{"保存按钮崩溃", "待处理", "AI 摘要", "NullPointerException", "assets/abc.png"} {
+	for _, want := range []string{
+		"保存按钮崩溃", "待处理", "AI 摘要", "NullPointerException", "assets/abc.png",
+		"1. 打开页面", "## 待办（1）", "交房租", "优先级：P1", "到期：2026-11-02（全天）",
+	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("export missing %q:\n%s", want, text)
 		}

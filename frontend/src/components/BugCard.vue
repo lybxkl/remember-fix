@@ -1,17 +1,30 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { AlertCircle, Image as ImageIcon, Loader2, Sparkles } from 'lucide-vue-next'
+import { AlertCircle, CheckCircle2, Image as ImageIcon, Loader2, Sparkles } from 'lucide-vue-next'
 import type { Bug as BugType } from '../lib/types'
-import { categoryLabel, firstLine, relativeTime, SEVERITY_META } from '../lib/constants'
+import {
+  KIND_META, SEVERITY_META, categoryLabel, dueMeta, firstLine, isDoneStatus, isOpen, relativeTime,
+} from '../lib/constants'
 
-const props = defineProps<{ bug: BugType }>()
-const emit = defineEmits<{ (e: 'open', id: string): void }>()
+const props = defineProps<{ bug: BugType; showKind?: boolean; now?: number }>()
+const emit = defineEmits<{
+  (e: 'open', id: string): void
+  (e: 'complete', bug: BugType): void
+}>()
 
 const sev = computed(() => SEVERITY_META[props.bug.severity] ?? SEVERITY_META.P2)
+const isTodo = computed(() => props.bug.kind === 'todo')
+const kind = computed(() => KIND_META[props.bug.kind] ?? KIND_META.bug)
+const due = computed(() =>
+  isTodo.value
+    ? dueMeta(props.bug.dueAt, props.bug.dueAllDay, isDoneStatus(props.bug.status), props.now)
+    : null,
+)
+const canComplete = computed(() => isTodo.value && isOpen(props.bug.status))
 const thumb = computed(() => props.bug.attachments.find((a) => a.type === 'image' && a.path)?.path ?? '')
 const imageCount = computed(() => props.bug.attachments.filter((a) => a.type === 'image').length)
 const titleText = computed(
-  () => props.bug.title || firstLine(props.bug.descriptionText, 48) || '未命名 Bug',
+  () => props.bug.title || firstLine(props.bug.descriptionText, 48) || '未命名事项',
 )
 const descPreview = computed(() => {
   const desc = firstLine(props.bug.descriptionText, 70)
@@ -30,6 +43,10 @@ function open() {
   emit('open', props.bug.id)
 }
 
+function complete() {
+  emit('complete', props.bug)
+}
+
 function onDragStart(e: DragEvent) {
   e.dataTransfer?.setData('text/rf-bug-id', props.bug.id)
   e.dataTransfer?.setData('text/plain', props.bug.id)
@@ -43,8 +60,8 @@ function onDragStart(e: DragEvent) {
     role="button"
     tabindex="0"
     draggable="true"
-    :style="{ '--sev': sev.color }"
-    :aria-label="`打开 ${titleText}`"
+    :style="{ '--sev': sev.color, '--kind': kind.color, '--kind-soft': kind.soft }"
+    :aria-label="`打开 ${kind.label}：${titleText}`"
     @click="open"
     @keydown.enter.prevent="open"
     @keydown.space.prevent="open"
@@ -52,8 +69,21 @@ function onDragStart(e: DragEvent) {
   >
     <div class="card-top">
       <span class="sev">{{ bug.severity }}</span>
-      <span class="cat">{{ categoryLabel(bug.category) }}</span>
+      <span v-if="showKind" class="kind-chip">{{ kind.label }}</span>
+      <span v-if="!isTodo" class="cat">{{ categoryLabel(bug.category) }}</span>
       <span class="spacer" />
+      <button
+        v-if="canComplete"
+        type="button"
+        class="quick-done"
+        title="标记完成"
+        aria-label="标记完成"
+        @click.stop="complete"
+        @keydown.enter.stop.prevent="complete"
+        @keydown.space.stop.prevent="complete"
+      >
+        <CheckCircle2 :size="13" />
+      </button>
       <span v-if="bug.aiStatus === 'pending'" class="ai pending" :title="aiTitle">
         <Loader2 :size="12" />
       </span>
@@ -69,7 +99,7 @@ function onDragStart(e: DragEvent) {
     <p v-if="descPreview" class="card-desc">{{ descPreview }}</p>
 
     <div v-if="thumb" class="card-thumb">
-      <img :src="'/shots/' + thumb" loading="lazy" alt="bug 截图" />
+      <img :src="'/shots/' + thumb" loading="lazy" alt="事项截图" />
       <span v-if="imageCount > 1" class="thumb-count"><ImageIcon :size="10" />{{ imageCount }}</span>
     </div>
 
@@ -79,7 +109,8 @@ function onDragStart(e: DragEvent) {
     </div>
 
     <footer class="card-foot">
-      <span class="time">{{ relativeTime(bug.createdAt) }}</span>
+      <span v-if="due" class="due-chip" :class="due.tone" :title="due.title">{{ due.text }}</span>
+      <span class="time">{{ relativeTime(bug.createdAt, now) }}</span>
       <span v-if="bug.sourceApp" class="source" :title="bug.sourceApp">{{ bug.sourceApp }}</span>
     </footer>
   </article>
@@ -137,7 +168,36 @@ function onDragStart(e: DragEvent) {
   line-height: 15px;
 }
 .cat { font-size: 10px; color: var(--rf-text-faint); }
+.kind-chip {
+  font-family: var(--rf-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  color: var(--kind);
+  background: var(--kind-soft);
+  border: 1px solid color-mix(in srgb, var(--kind) 30%, transparent);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 14px;
+}
 .spacer { flex: 1; }
+.quick-done {
+  width: 20px;
+  height: 18px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--rf-ok);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, background .12s ease;
+}
+.bug-card:hover .quick-done,
+.quick-done:focus-visible { opacity: 1; }
+.quick-done:hover { background: rgba(45, 122, 82, .1); }
 .ai { display: inline-flex; align-items: center; }
 .ai.pending { color: var(--rf-accent); }
 .ai.pending svg { animation: spin 1s linear infinite; }
@@ -212,11 +272,40 @@ function onDragStart(e: DragEvent) {
 .card-foot {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-top: 1px;
   font-size: 9.5px;
   color: var(--rf-text-faint);
+  min-width: 0;
 }
+.due-chip {
+  flex-shrink: 0;
+  font-size: 9px;
+  line-height: 15px;
+  border-radius: 3px;
+  padding: 0 4px;
+  border: 1px solid var(--rf-border);
+  color: var(--rf-text-dim);
+  background: var(--rf-well);
+  max-width: 88px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.due-chip.overdue {
+  color: var(--rf-danger);
+  background: rgba(180, 63, 54, .07);
+  border-color: rgba(180, 63, 54, .24);
+  font-weight: 700;
+}
+.due-chip.today {
+  color: var(--rf-accent);
+  background: var(--rf-accent-soft);
+  border-color: rgba(168, 99, 19, .26);
+  font-weight: 700;
+}
+.due-chip.soon { color: var(--rf-text-dim); }
+.due-chip.done { opacity: .72; background: transparent; }
 .time { flex-shrink: 0; }
 .source {
   margin-left: auto;

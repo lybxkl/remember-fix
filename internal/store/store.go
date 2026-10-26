@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS bugs (
   status           TEXT NOT NULL DEFAULT 'todo',
   category         TEXT NOT NULL DEFAULT 'uncategorized',
   severity         TEXT NOT NULL DEFAULT 'P2',
+  kind             TEXT NOT NULL DEFAULT 'bug',
+  kind_source      TEXT NOT NULL DEFAULT 'user',
+  due_at           INTEGER NOT NULL DEFAULT 0,
+  due_all_day      INTEGER NOT NULL DEFAULT 0,
   tags             TEXT NOT NULL DEFAULT '[]',
   attachments      TEXT NOT NULL DEFAULT '[]',
   source_app       TEXT NOT NULL DEFAULT '',
@@ -71,7 +75,55 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err != nil {
 		return fmt.Errorf("建表失败: %w", err)
 	}
+	// 旧库升级：历史记录都是 Bug，并锁定类型，避免 AI 重新分析时改写。
+	legacy := []struct{ name, ddl string }{
+		{"kind", `ALTER TABLE bugs ADD COLUMN kind TEXT NOT NULL DEFAULT 'bug'`},
+		{"kind_source", `ALTER TABLE bugs ADD COLUMN kind_source TEXT NOT NULL DEFAULT 'user'`},
+		{"due_at", `ALTER TABLE bugs ADD COLUMN due_at INTEGER NOT NULL DEFAULT 0`},
+		{"due_all_day", `ALTER TABLE bugs ADD COLUMN due_all_day INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, col := range legacy {
+		ok, err := hasColumn(db, "bugs", col.name)
+		if err != nil {
+			return fmt.Errorf("读取表结构失败: %w", err)
+		}
+		if ok {
+			continue
+		}
+		if _, err := db.Exec(col.ddl); err != nil {
+			return fmt.Errorf("升级字段 %s 失败: %w", col.name, err)
+		}
+	}
+	if _, err := db.Exec(`
+CREATE INDEX IF NOT EXISTS idx_bugs_kind ON bugs(kind);
+CREATE INDEX IF NOT EXISTS idx_bugs_due  ON bugs(due_at);
+`); err != nil {
+		return fmt.Errorf("创建索引失败: %w", err)
+	}
 	return nil
+}
+
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	if table != "bugs" {
+		return false, fmt.Errorf("未知的数据表: %s", table)
+	}
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) seedSettings() {

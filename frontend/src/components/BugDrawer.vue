@@ -3,10 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Copy, RefreshCw, Sparkles, Trash2, WandSparkles, X } from 'lucide-vue-next'
 import RichEditor from './RichEditor.vue'
+import KindSwitch from './KindSwitch.vue'
+import DueField from './DueField.vue'
 import { useBugs } from '../composables/useBugs'
 import { call, onEvent } from '../lib/wails'
-import type { Bug } from '../lib/types'
-import { CATEGORIES, SEVERITIES, SEVERITY_META, STATUS_COLUMNS, categoryLabel, formatTime } from '../lib/constants'
+import type { Bug, Kind, KindUndone } from '../lib/types'
+import {
+  CATEGORIES, SEVERITIES, SEVERITY_META, categoryLabel, formatTime, kindLabel, kindSourceLabel, statusOptions,
+} from '../lib/constants'
 import { renderMarkdown } from '../lib/markdown'
 import { modSymbol } from '../lib/platform'
 
@@ -19,18 +23,34 @@ const form = ref<Bug | null>(null)
 const fixPromptHtml = ref('')
 const fixPromptRaw = ref('')
 const fixPromptLoading = ref(false)
+const saving = ref(false)
 const editorRef = ref<InstanceType<typeof RichEditor>>()
 let offBug: (() => void) | undefined
 let offDeleted: (() => void) | undefined
+let offKindUndone: (() => void) | undefined
+let loadSeq = 0
+let promptSeq = 0
 
 watch(
   () => props.bugId,
   async (id) => {
-    if (!id) return
+    const seq = ++loadSeq
+    promptSeq++
+    fixPromptLoading.value = false
     fixPromptHtml.value = ''
     fixPromptRaw.value = ''
-    const b = await call<Bug>('main.BugService.Get', id)
-    form.value = JSON.parse(JSON.stringify(b))
+    form.value = null
+    if (!id) return
+    try {
+      const b = await call<Bug>('main.BugService.Get', id)
+      if (seq !== loadSeq) return
+      if (!b?.id) throw new Error('记录不存在')
+      form.value = JSON.parse(JSON.stringify(b))
+    } catch (e) {
+      if (seq !== loadSeq) return
+      ElMessage.error('读取记录失败：' + (e instanceof Error ? e.message : String(e)))
+      emit('close')
+    }
   },
   { immediate: true },
 )
@@ -44,24 +64,68 @@ onMounted(() => {
     f.aiStatus = b.aiStatus
     if (b.aiStatus === 'done') {
       if (titleWasEmpty) f.title = b.title
-      if (f.category === 'uncategorized') f.category = b.category
+      if (f.kindSource !== 'user' && b.kind !== f.kind) {
+        f.kind = b.kind
+        f.kindSource = b.kindSource
+        normalizeStatus()
+      }
+      if (!isTodo.value && f.category === 'uncategorized') f.category = b.category
       if (!f.tags?.length) f.tags = [...(b.tags ?? [])]
       if (titleWasEmpty && f.severity === 'P2' && b.severity !== 'P2') f.severity = b.severity
+      if (isTodo.value && !f.dueAt && b.dueAt) {
+        f.dueAt = b.dueAt
+        f.dueAllDay = b.dueAllDay
+      }
     }
   })
   offDeleted = onEvent<{ id: string }>('bug:deleted', ({ id }) => {
     if (form.value?.id === id) emit('close')
   })
+  offKindUndone = onEvent<KindUndone>('bug:kind-undone', (data) => {
+    const f = form.value
+    if (!f || !data || data.id !== f.id) return
+    f.kind = data.kind
+    f.kindSource = 'user'
+    f.status = data.status
+    f.dueAt = data.dueAt
+    f.dueAllDay = data.dueAllDay
+    normalizeStatus()
+  })
   window.addEventListener('keydown', onKeydown, true)
 })
 
 onBeforeUnmount(() => {
+  loadSeq++
+  promptSeq++
   offBug?.()
   offDeleted?.()
+  offKindUndone?.()
   window.removeEventListener('keydown', onKeydown, true)
 })
 
 const sevColor = computed(() => (s: string) => SEVERITY_META[s]?.color ?? '#7a756a')
+const isTodo = computed(() => form.value?.kind === 'todo')
+const statusCols = computed(() => statusOptions(form.value?.kind ?? 'bug'))
+
+function severityLabel(severity: string): string {
+  if (isTodo.value) {
+    return ({ P0: 'P0 紧急', P1: 'P1 紧急', P2: 'P2 一般', P3: 'P3 不急' } as Record<string, string>)[severity] ?? severity
+  }
+  return SEVERITY_META[severity]?.label ?? severity
+}
+
+function normalizeStatus() {
+  const f = form.value
+  if (f && f.kind === 'todo' && f.status === 'verified') f.status = 'fixed'
+}
+
+function setKind(kind: Kind) {
+  const f = form.value
+  if (!f || f.kind === kind) return
+  f.kind = kind
+  f.kindSource = 'user'
+  normalizeStatus()
+}
 
 function onKeydown(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
@@ -75,17 +139,30 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 async function persist() {
+  if (saving.value) return
   const f = form.value
   if (!f) return
+  const id = f.id
+  const seq = loadSeq
   f.descriptionText = htmlToText(f.description)
   if (!f.title.trim() && !f.descriptionText.trim()) {
     ElMessage.warning('标题和描述至少填一个')
     return
   }
-  await save(f)
-  ElMessage.success('已保存')
-  emit('saved')
-  emit('close')
+  normalizeStatus()
+  saving.value = true
+  try {
+    await save(f)
+    ElMessage.success('已保存')
+    if (form.value?.id === id && loadSeq === seq) {
+      emit('saved')
+      emit('close')
+    }
+  } catch (e) {
+    ElMessage.error('保存失败：' + (e instanceof Error ? e.message : String(e)))
+  } finally {
+    saving.value = false
+  }
 }
 
 function htmlToText(html: string): string {
@@ -96,14 +173,22 @@ function htmlToText(html: string): string {
 async function onDelete() {
   const f = form.value
   if (!f) return
-  await ElMessageBox.confirm('确定删除这条记录吗？截图会在后续清理中一并移除。', '删除确认', {
-    type: 'warning',
-    confirmButtonText: '删除',
-    cancelButtonText: '取消',
-  })
-  await remove(f.id)
-  ElMessage.success('已删除')
-  emit('close')
+  try {
+    await ElMessageBox.confirm('确定删除这条记录吗？截图会在后续清理中一并移除。', '删除确认', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    await remove(f.id)
+    ElMessage.success('已删除')
+    if (form.value?.id === f.id) emit('close')
+  } catch (e) {
+    ElMessage.error('删除失败：' + (e instanceof Error ? e.message : String(e)))
+  }
 }
 
 function applyAI() {
@@ -111,9 +196,18 @@ function applyAI() {
   const ai = f?.ai
   if (!f || !ai) return
   if (!f.title.trim()) f.title = ai.title
-  f.category = ai.category
+  if (ai.kind) {
+    f.kind = ai.kind
+    f.kindSource = 'user'
+    normalizeStatus()
+  }
+  if (!isTodo.value) f.category = ai.category
   f.severity = ai.severity
   f.tags = [...new Set([...(f.tags ?? []), ...ai.tags])]
+  if (f.kind === 'todo' && !f.dueAt && ai.dueAt) {
+    f.dueAt = ai.dueAt
+    f.dueAllDay = ai.dueAllDay
+  }
   ElMessage.success('已应用 AI 建议')
 }
 
@@ -140,14 +234,18 @@ function insertShot() {
 async function onFixPrompt() {
   const f = form.value
   if (!f) return
+  const seq = ++promptSeq
   fixPromptLoading.value = true
   try {
-    fixPromptRaw.value = await fixPrompt(f.id)
-    fixPromptHtml.value = renderMarkdown(fixPromptRaw.value)
+    const raw = await fixPrompt(f.id)
+    if (seq !== promptSeq || form.value?.id !== f.id) return
+    fixPromptRaw.value = raw
+    fixPromptHtml.value = renderMarkdown(raw)
   } catch (e) {
+    if (seq !== promptSeq) return
     ElMessage.error('生成失败：' + (e instanceof Error ? e.message : String(e)))
   } finally {
-    fixPromptLoading.value = false
+    if (seq === promptSeq) fixPromptLoading.value = false
   }
 }
 
@@ -156,17 +254,36 @@ async function copyFixPrompt() {
   if (!f) return
   try {
     if (!fixPromptRaw.value) {
+      const seq = ++promptSeq
       fixPromptLoading.value = true
-      fixPromptRaw.value = await fixPrompt(f.id)
-      fixPromptHtml.value = renderMarkdown(fixPromptRaw.value)
+      try {
+        const raw = await fixPrompt(f.id)
+        if (seq !== promptSeq || form.value?.id !== f.id) return
+        fixPromptRaw.value = raw
+        fixPromptHtml.value = renderMarkdown(raw)
+      } finally {
+        if (seq === promptSeq) fixPromptLoading.value = false
+      }
     }
     const ok = await call<boolean>('main.ConfigService.CopyText', fixPromptRaw.value)
     if (ok) ElMessage.success('修复指令已复制，可直接粘贴给 AI 编程工具')
     else ElMessage.error('复制失败')
   } catch (e) {
     ElMessage.error('生成失败：' + (e instanceof Error ? e.message : String(e)))
-  } finally {
-    fixPromptLoading.value = false
+  }
+}
+
+async function onFixBoxClick(e: MouseEvent) {
+  const link = (e.target as Element | null)?.closest('a')
+  if (!link) return
+  e.preventDefault()
+  const href = link.getAttribute('href') ?? ''
+  if (!/^https?:\/\//i.test(href)) return
+  try {
+    const ok = await call<boolean>('main.ConfigService.OpenURL', href)
+    if (!ok) ElMessage.error('链接格式无效或打开失败')
+  } catch {
+    ElMessage.error('打开链接失败')
   }
 }
 </script>
@@ -184,26 +301,40 @@ async function copyFixPrompt() {
     <div v-if="form" class="drawer">
       <header class="drawer-head">
         <div class="drawer-id">
-          <span class="eyebrow">BUG / {{ form.id.slice(0, 8).toUpperCase() }}</span>
+          <span class="eyebrow">{{ isTodo ? 'TODO' : 'BUG' }} / {{ form.id.slice(0, 8).toUpperCase() }}</span>
           <span class="drawer-created">{{ formatTime(form.createdAt) }} 创建<span v-if="form.sourceApp"> · {{ form.sourceApp }}</span></span>
         </div>
         <button class="icon-btn" title="关闭" @click="emit('close')"><X :size="17" /></button>
       </header>
 
       <div class="drawer-scroll">
-        <input v-model="form.title" class="title-input" placeholder="标题（留空则由 AI 生成）" />
+        <input
+          v-model="form.title"
+          class="title-input"
+          :placeholder="isTodo ? '要做什么（留空由 AI 生成）' : '标题（留空则由 AI 生成）'"
+        />
+
+        <div class="kind-row">
+          <KindSwitch
+            :model-value="form.kind"
+            compact
+            :hint="kindSourceLabel(form.kindSource)"
+            @update:model-value="setKind"
+          />
+          <span v-if="form.kindSource === 'ai'" class="kind-note">AI 高置信自动纠正，可在看板上撤销</span>
+        </div>
 
         <div class="meta-row">
           <el-select v-model="form.status" style="width: 108px">
-            <el-option v-for="c in STATUS_COLUMNS" :key="c.key" :value="c.key" :label="c.label" />
+            <el-option v-for="c in statusCols" :key="c.key" :value="c.key" :label="c.label" />
           </el-select>
-          <el-select v-model="form.category" style="width: 120px">
+          <el-select v-if="!isTodo" v-model="form.category" style="width: 120px">
             <el-option v-for="c in CATEGORIES" :key="c.key" :value="c.key" :label="c.label" />
           </el-select>
           <el-select v-model="form.severity" style="width: 116px">
             <el-option v-for="s in SEVERITIES" :key="s" :value="s">
               <span :style="{ color: sevColor(s), fontWeight: 700 }">{{ s }}</span>
-              <span style="margin-left: 6px">{{ SEVERITY_META[s]?.label.slice(3) }}</span>
+              <span style="margin-left: 6px">{{ severityLabel(s) }}</span>
             </el-option>
           </el-select>
           <el-select
@@ -214,6 +345,10 @@ async function copyFixPrompt() {
           >
             <el-option v-for="t in form.tags" :key="t" :value="t" :label="t" />
           </el-select>
+        </div>
+
+        <div v-if="isTodo" class="due-row">
+          <DueField v-model="form.dueAt" v-model:all-day="form.dueAllDay" />
         </div>
 
         <div v-if="form.attachments.length" class="attachments">
@@ -240,7 +375,7 @@ async function copyFixPrompt() {
         <RichEditor
           ref="editorRef"
           v-model="form.description"
-          placeholder="复现步骤、期望/实际结果…"
+          :placeholder="isTodo ? '要办什么、时间限制、需要带什么…' : '复现步骤、期望/实际结果…'"
           :min-height="120"
           @insert-shot="insertShot"
         />
@@ -267,40 +402,47 @@ async function copyFixPrompt() {
           <template v-else-if="form.ai">
             <div class="ai-title">{{ form.ai.title }}</div>
             <div class="ai-meta">
+              <span v-if="form.ai.kind" class="ai-kind">{{ kindLabel(form.ai.kind) }}</span>
+              <span v-if="form.ai.kind && form.ai.kindConfidence" class="ai-conf">
+                判型 {{ Math.round(form.ai.kindConfidence * 100) }}%
+              </span>
               <span class="ai-sev" :style="{ color: SEVERITY_META[form.ai.severity]?.color }">{{ form.ai.severity }}</span>
-              <span>{{ categoryLabel(form.ai.category) }}</span>
+              <span v-if="!isTodo">{{ categoryLabel(form.ai.category) }}</span>
+              <span v-if="isTodo && form.ai.dueAt" class="ai-due">有到期时间</span>
               <span v-for="t in form.ai.tags" :key="t" class="ai-tag">{{ t }}</span>
             </div>
             <p class="ai-summary">{{ form.ai.summary }}</p>
-            <ol v-if="form.ai.steps?.length" class="ai-steps">
+            <ol v-if="!isTodo && form.ai.steps?.length" class="ai-steps">
               <li v-for="(s, i) in form.ai.steps" :key="i">{{ s }}</li>
             </ol>
           </template>
           <div v-else class="ai-muted">还没有分析结果。保存后会自动分析，也可以点上方“分析”。</div>
         </div>
 
-        <div class="section-head">
-          <span class="section-label">修复指令</span>
-          <button class="text-btn" :disabled="fixPromptLoading" @click="onFixPrompt">
-            <RefreshCw :size="12" :class="{ spin: fixPromptLoading }" />
-            {{ fixPromptHtml ? '重新生成' : '生成' }}
-          </button>
-          <span class="section-spacer" />
-          <button class="text-btn" :disabled="fixPromptLoading" @click="copyFixPrompt">
-            <Copy :size="12" /> 复制
-          </button>
-        </div>
-        <div v-if="fixPromptHtml" class="fix-box rf-md" v-html="fixPromptHtml" />
-        <div v-else class="fix-empty">
-          生成可直接投喂 Claude Code / Cursor 的修复指令，包含定位建议、验收标准与回归风险。
-        </div>
+        <template v-if="!isTodo">
+          <div class="section-head">
+            <span class="section-label">修复指令</span>
+            <button class="text-btn" :disabled="fixPromptLoading" @click="onFixPrompt">
+              <RefreshCw :size="12" :class="{ spin: fixPromptLoading }" />
+              {{ fixPromptHtml ? '重新生成' : '生成' }}
+            </button>
+            <span class="section-spacer" />
+            <button class="text-btn" :disabled="fixPromptLoading" @click="copyFixPrompt">
+              <Copy :size="12" /> 复制
+            </button>
+          </div>
+          <div v-if="fixPromptHtml" class="fix-box rf-md" v-html="fixPromptHtml" @click="onFixBoxClick" />
+          <div v-else class="fix-empty">
+            生成可直接投喂 Claude Code / Cursor 的修复指令，包含定位建议、验收标准与回归风险。
+          </div>
+        </template>
       </div>
 
       <footer class="drawer-foot">
         <button class="btn-danger-ghost" @click="onDelete"><Trash2 :size="14" /> 删除</button>
         <span class="spacer" />
         <button class="btn-ghost" @click="emit('close')">取消</button>
-        <button class="btn-outline" @click="persist">保存</button>
+        <button class="btn-outline" :disabled="saving" @click="persist">{{ saving ? '保存中…' : '保存' }}</button>
       </footer>
     </div>
   </el-drawer>
@@ -353,7 +495,10 @@ async function copyFixPrompt() {
 }
 .title-input:focus { border-bottom-color: var(--rf-accent); }
 .title-input::placeholder { color: var(--rf-text-faint); font-weight: 500; }
+.kind-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.kind-note { font-size: 10px; color: var(--rf-accent); opacity: .9; }
 .meta-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.due-row { padding: 1px 0; }
 .attachments { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .attach-img { width: 132px; height: 82px; border-radius: 9px; border: 1px solid var(--rf-border); }
 .attach-text {
@@ -413,6 +558,17 @@ async function copyFixPrompt() {
 .ai-error { color: var(--rf-danger); font-size: 12px; line-height: 1.6; }
 .ai-title { font-weight: 700; font-size: 13.5px; margin-bottom: 5px; }
 .ai-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 10.5px; color: var(--rf-text-dim); margin-bottom: 7px; }
+.ai-kind {
+  color: var(--rf-blue);
+  background: rgba(59, 104, 173, .08);
+  border: 1px solid rgba(59, 104, 173, .18);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-weight: 700;
+}
+.ai-kind:only-child { color: var(--rf-accent); background: var(--rf-accent-soft); border-color: rgba(168, 99, 19, .18); }
+.ai-conf { font-family: var(--rf-mono); font-size: 9.5px; color: var(--rf-text-faint); }
+.ai-due { color: var(--rf-text-faint); }
 .ai-sev { font-weight: 800; font-family: var(--rf-mono); }
 .ai-tag { color: var(--rf-accent); background: var(--rf-accent-soft); border-radius: 3px; padding: 1px 5px; }
 .ai-summary { margin: 0; line-height: 1.65; color: var(--rf-text); }
@@ -450,6 +606,8 @@ async function copyFixPrompt() {
 .btn-ghost:hover { color: var(--rf-text); background: var(--rf-card); }
 .btn-outline { color: var(--rf-accent); background: transparent; border: 1px solid rgba(168, 99, 19, .48); }
 .btn-outline:hover { background: var(--rf-accent-soft); border-color: var(--rf-accent); }
+.btn-outline:disabled { color: var(--rf-text-faint); border-color: var(--rf-border); cursor: default; }
+.btn-outline:disabled:hover { background: transparent; border-color: var(--rf-border); }
 .btn-danger-ghost { color: var(--rf-text-faint); background: transparent; border: 1px solid transparent; }
 .btn-danger-ghost:hover { color: var(--rf-danger); background: rgba(180, 63, 54, .07); }
 </style>
